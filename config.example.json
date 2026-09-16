@@ -1,0 +1,30 @@
+{
+  "host": "127.0.0.1",
+  "port": 48190,
+  "database": "data/index.sqlite",
+  "backend": {
+    "url": "http://127.0.0.1:48178/",
+    "cookieFile": "/home/connectcoin/.connectcoin/testnet4/.cookie",
+    "timeoutMs": 30000,
+    "maxResponseBytes": 268435456
+  },
+  "pollIntervalMs": 2000,
+  "api": {
+    "pageSize": 100,
+    "maxSubscriptionsPerIP": 100,
+    "maxSubscriptions": 10000,
+    "maxJournalEvents": 10000,
+    "maxJournalBytes": 8388608,
+    "maxTransactionBytes": 400000
+  },
+  "transport": {
+    "maxConnections": 128,
+    "maxConnectionsPerIp": 8,
+    "maxConcurrentRequests": 32,
+    "maxPendingRequestsPerConnection": 16,
+    "maxFrameBytes": 1048576,
+    "maxResponseBytes": 2097152,
+    "maxQueuedOutputBytes": 4194304,
+    "requestTimeoutMs": 60000
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "name": "connectcoin-json-rpc",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Restricted, indexed ConnectCoin JSON-RPC over unencrypted TCP",
+  "type": "module",
+  "engines": { "node": ">=24.0.0" },
+  "scripts": {
+    "start": "node src/main.mjs",
+    "test": "node --test test/*.test.mjs",
+    "test:regtest": "node scripts/regtest.mjs",
+    "check": "node scripts/check.mjs"
+  },
+  "license": "MIT"
+}
