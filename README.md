@@ -27,7 +27,7 @@ npm start
 
 In PowerShell, use `Copy-Item config.example.json config.json`. If PowerShell prevents `npm.ps1` execution, use `npm.cmd`.
 
-The existing ConnectCoin node must have RPC enabled (`server=1`), retain all blocks (`prune=0`), and have completed its initial sync. **No wallet, `txindex`, block filter index, or spender index is required.** The first run indexes the chain from genesis; subsequent runs resume the database. Address history is chain-wide; **only bounty metadata/discovery is restricted to 600 blocks**. Indexing a large chain takes time and disk space. Queries return an explicit not-ready error during initial synchronization, a detected chain change or a backend failure rather than serving a partial index.
+The existing ConnectCoin node must have RPC enabled (`server=1`), retain all blocks (`prune=0`), and have completed its initial sync. **No wallet, `txindex`, block filter index, or spender index is required.** The first run indexes the chain from genesis; subsequent runs resume the database. Address history is chain-wide; **only bounty metadata/discovery is restricted to 600 blocks**. Indexing a large chain takes time and disk space. Indexed queries briefly wait (at most two seconds) for healthy synchronization already in progress, then return an explicit not-ready error if necessary rather than serving a partial index. Backend failures remain explicit. Transaction broadcast does not depend on index readiness: once the index has pinned a network identity, the service checks that the local node still matches it and forwards the transaction for normal node validation.
 
 The default backend is the local testnet4 RPC at `http://127.0.0.1:48178/`. Configure `cookieFile` with the actual cookie path, for example:
 
@@ -35,6 +35,8 @@ The default backend is the local testnet4 RPC at `http://127.0.0.1:48178/`. Conf
 - Windows: use the node's configured data directory, with JSON forward slashes or escaped backslashes.
 
 Cookie authentication is re-read on requests, so node restarts do not require copying credentials. Alternatively, remove `cookieFile` and supply `CONNECTCOIN_RPC_USER` and `CONNECTCOIN_RPC_PASSWORD` in the environment. Never commit real credentials. Relative file paths resolve against the configuration file's directory.
+
+Local service logs include safe synchronization diagnostics: duration, attempt count, start/end heights, readiness and a fixed phase/error category. Failed synchronizations and successful cycles taking at least one second are logged with separate 30-second throttles. Backend messages, transaction payloads and credentials are not logged. A not-ready response during brief catchup is not evidence of a node crash or a rate-limit violation.
 
 The public listener defaults to `127.0.0.1:48190`. To deliberately make it reachable from other machines, set `host` to `0.0.0.0` (IPv4) or the appropriate interface and open **only this service's port** in the firewall. Keep the node's administrative RPC bound to loopback. The backend client rejects non-loopback URLs and redirects. Do not put this behind a proxy that conceals client IP addresses; forwarded IP fields and PROXY protocol are not accepted.
 
@@ -110,6 +112,7 @@ It launches its **own temporary, network-disabled regtest node**, exercises actu
 - Bounties older than 600 blocks can remain consensus-valid even though this API will not list them.
 - All bounties created in a requested recent block are returned, including spent ones with explicit status. Filter `status: "available"` for candidates; competing claims can still race.
 - Automatic updates are polled from the local node (default two seconds), not instantaneous reservations. Reorganizations and change-log overflow require a fresh snapshot.
+- Continuous mempool arrivals do not force endless acquisition retries. The indexer may publish the complete snapshot captured at the start of collection when the node's exact sequence counter proves that only additions occurred and the chain tip is unchanged. Those later arrivals are picked up on subsequent polls. Removals, replacements or chain changes still require reconciliation; partial snapshots are never published.
 - `gettransaction` can help bind output fields to a txid if the client independently validates its serialization/hash. This API supplies no inclusion or unspentness proof. A metadata-only client must not mistake server-reported amounts for authenticated UTXO values.
 - Broadcast is not transaction construction, signing, mining, confirmation, or a promise of relay. Never send private keys or seeds.
 - Broad wallet-address indexing needs an unpruned node. The server does not repeatedly call `scantxoutset`, scan historical blocks on address requests, or expose private wallet RPCs.

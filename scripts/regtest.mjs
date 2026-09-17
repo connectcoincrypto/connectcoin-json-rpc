@@ -370,7 +370,13 @@ try {
     catch (error) { if (error.code !== -32001) throw error; return true; }
   }, 'CLI marks backend unavailable');
   assert.equal(cliClosed, false);
-  await pollUntil(() => cliOutput.includes('Index sync failed; queries are unavailable until recovery.'), 'safe syncError log');
+  const errorPrefix = 'Index sync failed; indexed queries are unavailable until recovery. ';
+  await pollUntil(() => cliOutput.includes(errorPrefix), 'safe syncError log');
+  const failureStats = JSON.parse(cliOutput.split('\n').find(line => line.startsWith(errorPrefix)).slice(errorPrefix.length));
+  assert.equal(failureStats.errorKind, 'backend');
+  assert.equal(failureStats.ready, false);
+  assert.ok(Number.isSafeInteger(failureStats.durationMs));
+  assert.deepEqual(Object.keys(failureStats).sort(), ['attempts', 'durationMs', 'endHeight', 'errorKind', 'phase', 'ready', 'startHeight']);
   assert.ok(!cliOutput.includes(cookieBeforeStop), 'CLI must not log backend credentials');
   assert.doesNotMatch(cliOutput, /Unhandled|uncaughtException|ERR_UNHANDLED_ERROR/);
   await startDaemon();

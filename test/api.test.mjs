@@ -34,7 +34,7 @@ const ADDRESS = address();
 function fixture(options = {}) {
   const indexer = new EventEmitter(); indexer.ready = true;
   let rev = 1;
-  const tip = { height: 650, hash: HASH, chain: 'regtest', mediantime: 123456 };
+  const tip = { height: 650, hash: HASH, chain: 'regtest', genesis_hash: OTHER, mediantime: 123456 };
   const bountyRows = Array.from({ length: 251 }, (_, vout) => ({ txid: HASH, vout, amount: '10000000001', status: 'available' }));
   const historyRows = bountyRows.map((r, i) => ({ txid: i.toString(16).padStart(64, '0'), received: r.amount, balance_delta: r.amount }));
   const store = {
@@ -50,7 +50,7 @@ function fixture(options = {}) {
   };
   const calls = [];
   const backend = {
-    call: async (...args) => { calls.push(args); return HASH; },
+    call: async (...args) => { calls.push(args); return args[0] === 'getblockchaininfo' ? { chain: tip.chain } : args[0] === 'getblockhash' ? OTHER : HASH; },
     transaction: async (...args) => { calls.push(args); return { txid: HASH, hex: 'aa', vout: [] }; },
   };
   const api = new PublicAPI({ store, indexer, backend, options });
@@ -157,8 +157,9 @@ test('transaction fetch and broadcast are narrow and sanitize backend errors', a
   await assert.rejects(f.api.dispatch('gettransaction', { txid: OTHER }, f.context), { code: -32004 });
   await assert.rejects(f.api.dispatch('sendrawtransaction', { transaction_hex: 'a' }, f.context), { code: -32602 });
   assert.equal((await f.api.dispatch('sendrawtransaction', { transaction_hex: 'aa'.repeat(50) }, f.context)).txid, HASH);
-  assert.deepEqual(f.calls[1], ['sendrawtransaction', ['aa'.repeat(50)]]);
-  f.backend.call = async () => { const e = new Error('secret credentials!'); e.code = -26; throw e; };
+  assert.deepEqual(f.calls[3], ['sendrawtransaction', ['aa'.repeat(50)]]);
+  const original = f.backend.call;
+  f.backend.call = async (...args) => { if (args[0] !== 'sendrawtransaction') return original(...args); const e = new Error('secret credentials!'); e.code = -26; throw e; };
   await assert.rejects(f.api.dispatch('sendrawtransaction', { transaction_hex: 'aa'.repeat(50) }, f.context), e => e.code === -32020 && !e.message.includes('secret') && e.data.node_code === -26);
 });
 

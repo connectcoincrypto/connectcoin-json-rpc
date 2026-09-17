@@ -46,7 +46,41 @@ export class PublicAPI {
   ready() {
     if (!this.indexer.ready || !this.tip()) throw new RpcError(-32001, 'Index is synchronizing or backend is unavailable; retry later.');
   }
-  async waitForReady(context) {
+  async broadcast(params, context) {
+    paramsOnly(params, ['transaction_hex']);
+    const hex = params.transaction_hex;
+    if (typeof hex !== 'string' || hex.length < 20 || hex.length % 2 || hex.length > this.options.maxTransactionBytes * 2 || !/^[0-9a-fA-F]+$/.test(hex)) {
+      throw new RpcError(-32602, `Expected transaction hex of at most ${this.options.maxTransactionBytes} bytes.`);
+    }
+    // Broadcasting needs node validation, not the address/mempool index. Keep
+    // network pinning even during catchup, failure recovery or a backend switch.
+    const pinned = this.tip();
+    if (!pinned?.chain || !/^[0-9a-f]{64}$/.test(pinned.genesis_hash ?? '')) {
+      throw new RpcError(-32001, 'Backend network identity is not initialized; retry after synchronization.');
+    }
+    const checkCancelled = () => {
+      if (context.signal?.aborted || this.indexer.stopping) throw new RpcError(-32001, 'Broadcast cancelled before submission.');
+    };
+    checkCancelled();
+    let info, genesis;
+    try {
+      info = await this.backend.call('getblockchaininfo');
+      genesis = await this.backend.call('getblockhash', [0]);
+    } catch {
+      throw new RpcError(-32002, 'Backend unavailable; transaction was not submitted.');
+    }
+    checkCancelled();
+    if (info?.chain !== pinned.chain || genesis !== pinned.genesis_hash) {
+      throw new RpcError(-32001, 'Backend network identity differs from this index; transaction was not submitted.');
+    }
+    try { return { txid: await this.backend.call('sendrawtransaction', [hex]) }; }
+    catch (error) {
+      // A failed/unknown broadcast must never be retried automatically here.
+      if ([-22, -25, -26, -27, -8].includes(error.code)) throw new RpcError(-32020, 'Node rejected the transaction.', { node_code: error.code });
+      throw new RpcError(-32002, 'Backend unavailable or broadcast outcome unknown; check the txid before retrying.');
+    }
+  }
+  async waitForReady(context, timeoutMs = 30000) {
     if (context.signal?.aborted) throw new RpcError(-32001, 'Transfer cancelled.');
     if (this.indexer.ready) return;
     // A short normal catchup must not restart a long stream. Wait for a fully
@@ -62,7 +96,7 @@ export class PublicAPI {
       const updated = () => { if (this.indexer.ready) finish(); };
       const failed = () => finish(new RpcError(-32001, 'Backend synchronization failed during transfer; retry later.'));
       const aborted = () => finish(new RpcError(-32001, 'Transfer cancelled.'));
-      const timer = setTimeout(failed, 30000);
+      const timer = setTimeout(failed, timeoutMs);
       this.indexer.on('update', updated);
       this.indexer.on('syncError', failed);
       context.signal?.addEventListener('abort', aborted, { once: true });
@@ -197,6 +231,13 @@ export class PublicAPI {
       const removed = Boolean(sub && sub.context === context && this.subscriptions.delete(sub.id));
       return { removed };
     }
+    if (method === 'sendrawtransaction') return this.broadcast(params, context);
+    // A request can arrive between applying a new block and publishing its
+    // coherent mempool overlay. Absorb short, healthy catchup, but do not serve
+    // partially indexed data or turn backend failures into unbounded waits.
+    if (!this.indexer.ready && this.indexer.pendingSync && !this.indexer.lastError && !this.indexer.stopping) {
+      await this.waitForReady(context, 2000);
+    }
     this.ready();
     switch (method) {
       case 'getchaintip': paramsOnly(params, []); return this.tip();
@@ -229,19 +270,6 @@ export class PublicAPI {
           throw new RpcError(-32011, 'Transaction state changed; retry this query.');
         }
         return { tip: this.tip(), ...location, transaction };
-      }
-      case 'sendrawtransaction': {
-        paramsOnly(params, ['transaction_hex']);
-        const hex = params.transaction_hex;
-        if (typeof hex !== 'string' || hex.length < 20 || hex.length % 2 || hex.length > this.options.maxTransactionBytes * 2 || !/^[0-9a-fA-F]+$/.test(hex)) {
-          throw new RpcError(-32602, `Expected transaction hex of at most ${this.options.maxTransactionBytes} bytes.`);
-        }
-        try { return { txid: await this.backend.call('sendrawtransaction', [hex]) }; }
-        catch (error) {
-          // Do not forward backend URLs, credentials or arbitrary diagnostic text.
-          if ([-22, -25, -26, -27, -8].includes(error.code)) throw new RpcError(-32020, 'Node rejected the transaction.', { node_code: error.code });
-          throw new RpcError(-32002, 'Backend unavailable or broadcast outcome unknown; check the txid before retrying.');
-        }
       }
       case 'getbountychanges': {
         paramsOnly(params, ['cursor']);

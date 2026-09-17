@@ -47,12 +47,20 @@ try {
     if (!wasReady) console.log(`Index ready at ${tip.height} (${tip.chain}).`);
     wasReady = true;
   });
-  // Do not log arbitrary node responses or RPC credentials.
+  // These stats contain only fixed categories/counters, never node responses,
+  // transaction data, addresses or RPC credentials. Bound repetitive log volume.
+  let lastSlowSync = -Infinity;
+  indexer.on('syncStats', stats => {
+    if (!stats.errorKind && stats.durationMs >= 1000 && Date.now() - lastSlowSync > 30000) {
+      console.log(`Index sync slow: ${JSON.stringify(stats)}`);
+      lastSlowSync = Date.now();
+    }
+  });
   let lastError = 0;
   indexer.on('syncError', () => {
     wasReady = false;
     if (Date.now() - lastError > 30000) {
-      console.error('Index sync failed; queries are unavailable until recovery. Check local node, authentication, unpruned history, and network identity.');
+      console.error(`Index sync failed; indexed queries are unavailable until recovery. ${JSON.stringify(indexer.lastSyncStats)}`);
       lastError = Date.now();
     }
   });
