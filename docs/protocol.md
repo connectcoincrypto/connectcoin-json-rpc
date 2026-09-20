@@ -16,7 +16,7 @@ The example omits other block entries for readability; the actual response conta
 
 ## Amounts and address queries
 
-Every indexed amount is a **base-10 integer string in connects**. One CC is **10,000,000,000 connects**, not Bitcoin's 100,000,000 satoshis. Use arbitrary-precision integers in clients. Strings prevent JavaScript/JSON's 53-bit precision limit from silently changing values.
+Every indexed amount is a **base-10 integer string in connects**. One CONN is **10,000,000,000 connects**, not Bitcoin's 100,000,000 satoshis. Use arbitrary-precision integers in clients. Strings prevent JavaScript/JSON's 53-bit precision limit from silently changing values.
 
 `getaddressbalance` returns:
 
@@ -92,7 +92,7 @@ Address notifications tell the client to refresh cached balance/history/UTXOs an
 
 `gettransaction` looks up the requested txid in the local active-chain/mempool index, then asks the node for that transaction with its known block hash. No `txindex` is required. Unknown/disconnected transactions are not searched by scanning the chain.
 
-Its `transaction` field preserves ConnectCoin node RPC's decoded schema, including `hex`. **Exception to indexed units:** monetary fields inside this raw-node transaction object (`value`, `fee`, etc.) are exact decimal strings in **CC**, because this is the node's schema. The envelope supplies indexed confirmation/location metadata. Clients must independently parse/hash transactions if they intend to verify the data.
+Its `transaction` field preserves ConnectCoin node RPC's decoded schema, including `hex`. **Exception to indexed units:** monetary fields inside this raw-node transaction object (`value`, `fee`, etc.) are exact decimal strings in **CONN**, because this is the node's schema. The envelope supplies indexed confirmation/location metadata. Clients must independently parse/hash transactions if they intend to verify the data.
 
 `sendrawtransaction` accepts only `transaction_hex`; it cannot forward RPC options that disable fee safeguards. Default submitted transaction cap is 400,000 bytes. Requests remain subject to the node's standardness, fee and consensus rules. A timeout can have an unknown broadcast outcome; check the locally known txid before retrying. The server does not sign, alter recipient outputs, generate proofs or reserve bounties.
 
