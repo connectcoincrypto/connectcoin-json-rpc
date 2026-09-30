@@ -196,6 +196,29 @@ try {
   await indexer.syncOnce();
   assert.equal(indexer.ready, true);
   assert.equal(store.tip().height, 101);
+  const genesisHash = await rpc('getblockhash', [0]);
+  const genesis = await backend.call('getblock', [genesisHash, 2]);
+  const genesisTx = genesis.tx[0];
+  const genesisAddress = genesisTx.vout[0].scriptPubKey.address;
+  const genesisAmount = '100000000000000000';
+  assert.equal(typeof genesisAddress, 'string');
+  assert.equal((await rpc('gettxout', [genesisTx.txid, 0])).coinbase, true);
+  assert.equal(store.balance(genesisAddress).available_confirmed, genesisAmount);
+  assert.equal(store.utxoPage(genesisAddress)[0].mature, true);
+  // Model an old index, then exercise the real backend's genesis serialization
+  // and automatic repair without deleting/reindexing the remaining chain.
+  store.atomic(() => {
+    store.db.exec('DELETE FROM outputs WHERE height=0; DELETE FROM history WHERE height=0;');
+    store.setMeta('schema', '1');
+    store.bump();
+  });
+  assert.equal(store.balance(genesisAddress).confirmed, '0');
+  await indexer.syncOnce();
+  assert.equal(indexer.ready, true);
+  assert.equal(store.meta('schema'), '2');
+  assert.equal(store.balance(genesisAddress).available_confirmed, genesisAmount);
+  assert.equal(store.historyPage(genesisAddress)[0].received, genesisAmount);
+  progress('Real genesis allocation and automatic legacy-index repair passed.');
   api = new PublicAPI({ store, indexer, backend });
   server = createRpcServer({ dispatch: api.dispatch, allowedMethods: METHODS, classifyBountyHash: api.classifyBountyHash });
   server.listen(0, '127.0.0.1');
@@ -204,6 +227,9 @@ try {
   await once(socket, 'connect');
   client = new Client(socket);
   assert.equal((await client.request('getchaintip')).height, 101);
+  assert.equal((await client.request('getaddressbalance', { address: genesisAddress })).available_confirmed, genesisAmount);
+  assert.equal((await client.request('getaddressutxos', { address: genesisAddress })).items[0].txid, genesisTx.txid);
+  assert.equal((await client.request('gettransaction', { txid: genesisTx.txid })).transaction.txid, genesisTx.txid);
   const tipSub = await client.request('subscribetip');
   const addressSub = await client.request('subscribeaddress', { address: receiver });
   const bountySub = await client.request('subscribebounties');

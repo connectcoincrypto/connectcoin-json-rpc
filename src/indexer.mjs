@@ -109,6 +109,14 @@ export class Indexer extends EventEmitter {
       catch (error) { stats.errorKind = 'network'; throw error; }
       let tip = this.store.tip();
       if (!tip || tip.hash !== info.bestblockhash) this.ready = false;
+      if (tip && this.store.needsGenesisRepair()) {
+        this.ready = false;
+        resync = true;
+        stats.phase = 'genesis_repair';
+        const block = await call('getblock', [genesis, 2]);
+        if (this.stopping) return;
+        this.store.repairGenesis(block);
+      }
       stats.phase = 'rollback';
       while (tip) {
         if (this.stopping) return;

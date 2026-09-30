@@ -37,7 +37,7 @@ class FakeBackend {
   }
 }
 function fixture(path = ':memory:') {
-  const genesis = block('genesis', null, [tx('genesis-tx', [output('50.0')])]);
+  const genesis = block('genesis', null, [tx('genesis-tx', [output('50.0', 'genesis-owner')])]);
   const funding = tx('funding', [output('100.0000000001')]);
   const first = block('first', genesis, [funding]);
   const transfer = tx('transfer', [output('60.0', 'bob'), output('39.0000000000'), bounty('1.0')], [input(funding)]);
@@ -58,7 +58,12 @@ test('indexes confirmed native address activity, exact amounts, and compact boun
   assert.equal(f.store.balance('alice').confirmed, '390000000000');
   assert.equal(f.store.balance('bob').confirmed, '600000000000');
   const history = f.store.history('alice');
-  assert.equal(history.length, 2, 'genesis output must not become an available balance');
+  assert.equal(history.length, 2);
+  assert.equal(f.store.balance('genesis-owner').confirmed, '500000000000');
+  assert.equal(f.store.balance('genesis-owner').immature, '500000000000');
+  assert.equal(f.store.balance('genesis-owner').available_confirmed, '0');
+  assert.equal(f.store.history('genesis-owner').length, 1);
+  assert.equal(f.store.utxos('genesis-owner')[0].mature, false);
   assert.equal(history[0].spent, '1000000000001');
   assert.equal(history[0].balance_delta, '-610000000001');
   assert.equal(f.store.utxos('alice').length, 1);

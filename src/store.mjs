@@ -86,9 +86,12 @@ export class Store {
         spender TEXT NOT NULL, PRIMARY KEY(txid,vout));
       CREATE TABLE IF NOT EXISTS pending_history (address TEXT NOT NULL, txid TEXT NOT NULL,
         received TEXT NOT NULL, spent TEXT NOT NULL, PRIMARY KEY(address,txid));
-      INSERT OR IGNORE INTO metadata VALUES ('schema','1');
+      INSERT OR IGNORE INTO metadata VALUES ('schema','2');
       INSERT OR IGNORE INTO metadata VALUES ('revision','0');`);
-    if (this.meta('schema') !== '1') throw new Error('Unsupported index database version');
+    if (!['1', '2'].includes(this.meta('schema'))) {
+      this.db.close();
+      throw new Error('Unsupported index database version');
+    }
     // SQLite transactions below are synchronous. Callers never observe half of
     // one block/mempool replacement; Indexer.ready guards multi-block catchup.
   }
@@ -123,12 +126,81 @@ export class Store {
     return this.db.prepare('SELECT height,hash FROM blocks WHERE bounty_indexed=0 AND height >= (SELECT MAX(height)-599 FROM blocks) ORDER BY height').all();
   }
 
+  needsGenesisRepair() { return this.meta('schema') === '1'; }
+  repairGenesis(block) {
+    if (!this.needsGenesisRepair()) return false;
+    const indexed = this.blockAt(0);
+    if (!indexed || block?.height !== 0 || block.hash !== indexed.hash
+        || block.hash !== this.meta('genesis')) throw new Error('Genesis repair requires the pinned indexed genesis block');
+    if (!Array.isArray(block.tx) || block.tx.length !== 1) throw new Error('Invalid genesis transaction list for index repair');
+    const tx = normalizeTransaction(block.tx[0]);
+    const stored = this.db.prepare('SELECT txid,position FROM transactions WHERE block_height=0').all();
+    if (!tx.coinbase || stored.length !== 1 || stored[0].txid !== tx.txid || stored[0].position !== 0) {
+      throw new Error('Genesis repair transaction does not match the existing index');
+    }
+    this.atomic(() => {
+      // Schema 1 skipped every genesis coinbase output and receipt. Refuse a
+      // manually/partially repaired index rather than risk applying debits twice.
+      for (const table of ['outputs', 'history', 'bounties']) {
+        if (this.db.prepare(`SELECT 1 FROM ${table} WHERE height=0 LIMIT 1`).get()) {
+          throw new Error('Genesis repair found unexpected existing genesis accounting');
+        }
+      }
+      const received = new Map();
+      const insertOutput = this.db.prepare('INSERT INTO outputs VALUES (?,?,?,?,?,?)');
+      const findSpend = this.db.prepare('SELECT spender,height FROM spends WHERE txid=? AND vout=?');
+      const findTransaction = this.db.prepare('SELECT block_height,position FROM transactions WHERE txid=?');
+      const findHistory = this.db.prepare('SELECT received,spent,height,position FROM history WHERE address=? AND txid=?');
+      const insertHistory = this.db.prepare('INSERT INTO history VALUES (?,?,?,?,?,?)');
+      const updateSpent = this.db.prepare('UPDATE history SET spent=? WHERE address=? AND txid=?');
+      for (const output of tx.outputs) {
+        if (output.address) {
+          insertOutput.run(tx.txid, output.vout, output.address, output.amount, 0, 1);
+          received.set(output.address, (received.get(output.address) ?? 0n) + BigInt(output.amount));
+          // Old indexes retained spends even when their source output was
+          // missing. Repair only the omitted debit, preserving other inputs
+          // and self-change. BigInt keeps ConnectCoin's ten decimals exact.
+          const spend = findSpend.get(tx.txid, output.vout);
+          if (spend) {
+            const location = findTransaction.get(spend.spender);
+            if (!location || location.block_height !== spend.height || spend.height <= 0) {
+              throw new Error('Genesis repair found an inconsistent spending transaction');
+            }
+            const history = findHistory.get(output.address, spend.spender);
+            if (history) {
+              if (history.height !== location.block_height || history.position !== location.position) {
+                throw new Error('Genesis repair found inconsistent spending history');
+              }
+              updateSpent.run(String(BigInt(history.spent) + BigInt(output.amount)), output.address, spend.spender);
+            } else {
+              insertHistory.run(output.address, spend.spender, location.block_height, location.position, '0', output.amount);
+            }
+          }
+        }
+        if (output.p2c && this.isRecentBlock(block.hash)) this.insertBounty(tx, output, 0);
+      }
+      for (const [address, amount] of received) insertHistory.run(address, tx.txid, 0, 0, String(amount), '0');
+      // Rebuild the overlay from a coherent backend snapshot before readers
+      // become ready. A restart/failure cannot preserve an old, wrong debit
+      // through the unchanged-mempool fingerprint shortcut.
+      this.db.exec(`DELETE FROM pending_history; DELETE FROM pending_spends;
+        DELETE FROM pending_outputs; DELETE FROM pending_transactions;
+        DELETE FROM metadata WHERE key IN ('mempool_fingerprint','mempool_tip');`);
+      // Transactional semantic-version bump also prevents old binaries from
+      // reopening a repaired index and reverting to the old genesis rules.
+      this.setMeta('schema', '2');
+      this.bump();
+    });
+    return true;
+  }
+
   applyBlock(block) {
     const before = this.tip();
     validHash(block.hash);
     if (!Number.isSafeInteger(block.height) || block.height !== (before?.height ?? -1) + 1
       || (before && block.previousblockhash !== before.hash)) throw new Error('Block does not extend indexed chain');
     if (!Array.isArray(block.tx) || !Number.isSafeInteger(block.mediantime)) throw new Error('Incomplete backend block');
+    if (block.height > 0 && this.needsGenesisRepair()) throw new Error('Repair genesis accounting before extending this index');
     const transactions = block.tx.map(normalizeTransaction);
     const addresses = new Set();
     const changes = [];
@@ -159,8 +231,8 @@ export class Store {
           if (findBounty.get(input.txid, input.vout)) track(null, { type: 'spent', txid: input.txid, vout: input.vout, spending_txid: tx.txid });
         }
         for (const output of tx.outputs) {
-          // The genesis coinbase is not added to the node's UTXO set.
-          if (block.height === 0 && tx.coinbase) continue;
+          // ConnectCoin includes its genesis allocation in the UTXO set; it
+          // follows the same coinbase maturity/accounting rules as later blocks.
           if (output.address) {
             insertOutput.run(tx.txid, output.vout, output.address, output.amount, block.height, Number(tx.coinbase));
             totalFor(output.address).received += BigInt(output.amount);
@@ -177,6 +249,7 @@ export class Store {
       this.db.prepare('DELETE FROM bounties WHERE height<?').run(minimum);
       this.db.prepare('UPDATE blocks SET bounty_indexed=0 WHERE height<? AND bounty_indexed=1').run(minimum);
       for (const row of this.db.prepare('SELECT txid,vout FROM bounties WHERE coinbase=1 AND height=?').iterate(block.height - 99)) track(null, { type: 'matured', ...row });
+      if (block.height === 0) this.setMeta('schema', '2');
       this.bump();
     });
     return { addresses: [...addresses], bountyChanges: changes, resync };
@@ -191,7 +264,7 @@ export class Store {
     this.atomic(() => {
       this.db.prepare('DELETE FROM bounties WHERE height=?').run(block.height);
       for (const tx of txs) for (const output of tx.outputs) {
-        if (output.p2c && !(block.height === 0 && tx.coinbase)) this.insertBounty(tx, output, block.height);
+        if (output.p2c) this.insertBounty(tx, output, block.height);
       }
       this.db.prepare('UPDATE blocks SET bounty_indexed=1 WHERE height=?').run(block.height);
       this.bump();
