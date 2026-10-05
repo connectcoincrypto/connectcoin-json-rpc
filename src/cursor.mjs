@@ -2,7 +2,10 @@ import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import { RpcError } from './errors.mjs';
 
 export class Cursors {
-  constructor() { this.key = randomBytes(32); }
+  constructor(key = randomBytes(32)) {
+    if (!Buffer.isBuffer(key) || key.length !== 32) throw new Error('Invalid cursor signing key');
+    this.key = Buffer.from(key);
+  }
   sign(value) {
     const body = Buffer.from(JSON.stringify(value)).toString('base64url');
     return `${body}.${createHmac('sha256', this.key).update(body).digest('base64url')}`;

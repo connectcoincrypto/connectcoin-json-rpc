@@ -79,3 +79,54 @@ test('cookie credentials are reread, response size/time are bounded, errors do n
   mode = 'timeout'; backend.timeoutMs = 100;
   await assert.rejects(backend.call('getblockchaininfo'), /timed out/);
 });
+
+test('compact raw transaction fetches use false verbosity and narrowing per-call response limits', async t => {
+  const seen = [], txid = 'ab'.repeat(32), block = 'cd'.repeat(32);
+  let raw = 'aa'.repeat(50);
+  const server = http.createServer((request, response) => {
+    let body = '';
+    request.on('data', chunk => { body += chunk; });
+    request.on('end', () => {
+      const rpc = JSON.parse(body); seen.push(rpc);
+      response.end(JSON.stringify({ id: rpc.id, result: raw }));
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const backend = new NodeBackend({ url: `http://127.0.0.1:${server.address().port}/`, username: 'test', password: 'test', maxResponseBytes: 1024 });
+  t.after(() => { backend.close(); server.closeAllConnections(); server.close(); });
+  assert.equal(await backend.rawTransaction(txid, block, { maxResponseBytes: 256, timeoutMs: 1000 }), raw);
+  assert.deepEqual(seen[0].params, [txid, false, block]);
+  await backend.rawTransaction(txid, undefined, { maxResponseBytes: 256 });
+  assert.deepEqual(seen[1].params, [txid, false]);
+  assert.ok(seen.every(call => call.method === 'getrawtransaction'));
+  raw = 'aa'.repeat(256);
+  await assert.rejects(backend.rawTransaction(txid, block, { maxResponseBytes: 256 }), { code: 'RESPONSE_TOO_LARGE' });
+  raw = 'aa'.repeat(1024);
+  await assert.rejects(backend.rawTransaction(txid, block, { maxResponseBytes: 4096 }), { code: 'RESPONSE_TOO_LARGE' });
+  await assert.rejects(backend.rawTransaction(txid, block, { timeoutMs: 0 }), /limits/);
+});
+
+test('compact backend abort destroys in-flight HTTP and deadlines include the agent queue', async t => {
+  const seen = [];
+  let entered;
+  const firstEntered = new Promise(resolve => { entered = resolve; });
+  const server = http.createServer((request, response) => {
+    let body = '';
+    request.on('data', chunk => { body += chunk; });
+    request.on('end', () => { seen.push(JSON.parse(body)); entered(); });
+    response.on('error', () => {});
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const backend = new NodeBackend({ url: `http://127.0.0.1:${server.address().port}/`, username: 'test', password: 'test', timeoutMs: 5000 });
+  backend.agent.maxSockets = 1;
+  t.after(() => { backend.close(); server.closeAllConnections(); server.close(); });
+  const controller = new AbortController();
+  const first = backend.rawTransaction('ab'.repeat(32), undefined, { signal: controller.signal });
+  const rejected = assert.rejects(first, { code: 'ABORT_ERR' });
+  await firstEntered;
+  await assert.rejects(backend.rawTransaction('cd'.repeat(32), undefined, { timeoutMs: 40 }), { code: 'TIMEOUT' });
+  assert.equal(seen.length, 1, 'Timed-out agent-queued work must never reach the backend');
+  controller.abort(); await rejected;
+  await assert.rejects(backend.rawTransaction('ab'.repeat(32), undefined, { signal: controller.signal }), { code: 'ABORT_ERR' });
+  assert.equal(seen.length, 1);
+});

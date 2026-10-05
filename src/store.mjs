@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { toConnects } from './backend.mjs';
 
 const HASH = /^[0-9a-f]{64}$/;
@@ -49,9 +49,14 @@ export function normalizeTransaction(tx) {
 }
 
 export class Store {
-  constructor(path = ':memory:', { window = 600 } = {}) {
+  constructor(path = ':memory:', { window = 600, maxAddressEvents = 100000, maxAddressBytes = 32 * 1024 * 1024,
+    maxAddressMutationKeys = 10000 } = {}) {
     if (window !== 600) throw new Error('The public bounty window is fixed at 600 blocks');
+    for (const value of [maxAddressEvents, maxAddressBytes, maxAddressMutationKeys]) {
+      if (!Number.isSafeInteger(value) || value < 1) throw new Error('Invalid address journal bound');
+    }
     this.window = window;
+    Object.assign(this, { maxAddressEvents, maxAddressBytes, maxAddressMutationKeys });
     this.balanceCache = new Map();
     this.db = new DatabaseSync(path);
     this.db.exec(`PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;
@@ -86,20 +91,152 @@ export class Store {
         spender TEXT NOT NULL, PRIMARY KEY(txid,vout));
       CREATE TABLE IF NOT EXISTS pending_history (address TEXT NOT NULL, txid TEXT NOT NULL,
         received TEXT NOT NULL, spent TEXT NOT NULL, PRIMARY KEY(address,txid));
+      CREATE TABLE IF NOT EXISTS address_journal (sequence INTEGER PRIMARY KEY, address TEXT NOT NULL,
+        payload TEXT NOT NULL, bytes INTEGER NOT NULL);
+      CREATE INDEX IF NOT EXISTS address_journal_address_sequence ON address_journal(address,sequence);
       INSERT OR IGNORE INTO metadata VALUES ('schema','2');
-      INSERT OR IGNORE INTO metadata VALUES ('revision','0');`);
+      INSERT OR IGNORE INTO metadata VALUES ('revision','0');
+      INSERT OR IGNORE INTO metadata VALUES ('address_sequence','0');
+      INSERT OR IGNORE INTO metadata VALUES ('address_floor','0');
+      INSERT OR IGNORE INTO metadata VALUES ('address_epoch','0');
+      INSERT OR IGNORE INTO metadata VALUES ('address_journal_bytes','0');`);
     if (!['1', '2'].includes(this.meta('schema'))) {
       this.db.close();
       throw new Error('Unsupported index database version');
     }
     // SQLite transactions below are synchronous. Callers never observe half of
     // one block/mempool replacement; Indexer.ready guards multi-block catchup.
+    if (!this.meta('address_cursor_key')) this.setMeta('address_cursor_key', randomBytes(32).toString('hex'));
+    // An older service binary can still understand schema-2 accounting, but
+    // cannot maintain this journal. Detect intervening writes on upgrade again
+    // rather than accepting persisted cursors with an unrecorded gap.
+    if (this.meta('address_journal_revision') !== String(this.revision())) {
+      this.atomic(() => { this.resetAddressJournal(); this.setMeta('address_journal_revision', this.revision()); });
+    }
   }
 
   meta(name) { return this.db.prepare('SELECT value FROM metadata WHERE key=?').get(name)?.value ?? null; }
   setMeta(name, value) { this.db.prepare('INSERT OR REPLACE INTO metadata VALUES (?,?)').run(name, String(value)); }
   revision() { return Number(this.meta('revision')); }
-  bump() { this.setMeta('revision', this.revision() + 1); this.balanceCache.clear(); }
+  bump() {
+    const revision = this.revision() + 1;
+    this.setMeta('revision', revision); this.setMeta('address_journal_revision', revision); this.balanceCache.clear();
+  }
+  addressChangeState() {
+    return { sequence: Number(this.meta('address_sequence')), floor: Number(this.meta('address_floor')),
+      epoch: Number(this.meta('address_epoch')) };
+  }
+  resetAddressJournal() {
+    const state = this.addressChangeState();
+    if (!Number.isSafeInteger(state.sequence + 1) || !Number.isSafeInteger(state.epoch + 1)) throw new Error('Address journal counter exhausted');
+    this.db.exec('DELETE FROM address_journal');
+    this.setMeta('address_sequence', state.sequence + 1);
+    this.setMeta('address_floor', state.sequence + 1);
+    this.setMeta('address_epoch', state.epoch + 1);
+    this.setMeta('address_journal_bytes', 0);
+  }
+  newAddressTouches() { return { keys: new Map(), overflow: false }; }
+  touchAddress(touches, address, kind, txid, vout) {
+    if (!address || touches.overflow) return;
+    const id = `${address}:${kind}:${txid}:${vout ?? ''}`;
+    touches.keys.set(id, { address, kind, txid, ...(kind === 'utxo' ? { vout } : {}) });
+    if (touches.keys.size > this.maxAddressMutationKeys) { touches.overflow = true; touches.keys.clear(); }
+  }
+  pendingMutationTouches(transactions) {
+    // Compare immutable transaction membership/payloads, then journal ONLY the
+    // affected keys. A large unchanged overlay must not repeatedly exhaust the
+    // mutation bound or force clients to reload their entire address history.
+    const touches = this.newAddressTouches(), current = new Map(transactions.map(tx => [tx.txid, tx]));
+    const seen = new Set();
+    const confirmed = this.db.prepare('SELECT address FROM outputs WHERE txid=? AND vout=?');
+    const pending = this.db.prepare('SELECT address FROM pending_outputs WHERE txid=? AND vout=?');
+    const collect = (tx, next) => {
+      for (const output of tx.outputs) {
+        this.touchAddress(touches, output.address, 'utxo', tx.txid, output.vout);
+        this.touchAddress(touches, output.address, 'history', tx.txid);
+      }
+      for (const input of tx.inputs) {
+        const source = next ? current.get(input.txid)?.outputs[input.vout] ?? confirmed.get(input.txid, input.vout)
+          : pending.get(input.txid, input.vout) ?? confirmed.get(input.txid, input.vout);
+        this.touchAddress(touches, source?.address, 'utxo', input.txid, input.vout);
+        this.touchAddress(touches, source?.address, 'history', tx.txid);
+      }
+    };
+    for (const row of this.db.prepare('SELECT txid,payload FROM pending_transactions').iterate()) {
+      const next = current.get(row.txid); seen.add(row.txid);
+      if (!next || row.payload !== JSON.stringify(next)) {
+        collect(JSON.parse(row.payload), false);
+        if (next) collect(next, true);
+      }
+      if (touches.overflow) return touches;
+    }
+    for (const tx of transactions) {
+      if (!seen.has(tx.txid)) collect(tx, true);
+      if (touches.overflow) return touches;
+    }
+    return touches;
+  }
+  addressItem({ address, kind, txid, vout }) {
+    if (kind === 'history') {
+      const row = this.db.prepare(`SELECT h.received,h.spent,h.height,b.hash AS block_hash FROM history h
+        JOIN blocks b ON b.height=h.height WHERE h.address=? AND h.txid=?`).get(address, txid);
+      const pending = row ? null : this.db.prepare('SELECT received,spent FROM pending_history WHERE address=? AND txid=?').get(address, txid);
+      const value = row ?? pending;
+      return value ? { txid, status: row ? 'confirmed' : 'pending', block_height: row?.height ?? null,
+        block_hash: row?.block_hash ?? null, received: value.received, spent: value.spent,
+        balance_delta: String(BigInt(value.received) - BigInt(value.spent)) } : null;
+    }
+    const row = this.db.prepare(`SELECT o.amount,o.height,o.coinbase,s.spender,p.spender AS pending_spent_by
+      FROM outputs o LEFT JOIN spends s USING(txid,vout) LEFT JOIN pending_spends p USING(txid,vout)
+      WHERE o.address=? AND o.txid=? AND o.vout=?`).get(address, txid, vout);
+    if (row?.spender) return null;
+    const pending = row ? null : this.db.prepare(`SELECT o.amount,p.spender AS pending_spent_by FROM pending_outputs o
+      LEFT JOIN pending_spends p USING(txid,vout) WHERE o.address=? AND o.txid=? AND o.vout=?`).get(address, txid, vout);
+    const value = row ?? pending;
+    return value ? { txid, vout, amount: value.amount, block_height: row?.height ?? null,
+      status: row ? 'confirmed' : 'pending', coinbase: Boolean(row?.coinbase), pending_spent_by: value.pending_spent_by ?? null } : null;
+  }
+  appendAddressChanges(touches, before = null) {
+    if (touches.overflow) { this.resetAddressJournal(); return; }
+    let { sequence } = this.addressChangeState();
+    let bytes = Number(this.meta('address_journal_bytes'));
+    const insert = this.db.prepare('INSERT INTO address_journal VALUES (?,?,?,?)');
+    for (const [id, entry] of touches.keys) {
+      const item = this.addressItem(entry);
+      if (before && (before.get(id) ?? null) === (item ? JSON.stringify(item) : null)) continue;
+      if (!Number.isSafeInteger(++sequence)) throw new Error('Address journal counter exhausted');
+      const event = { sequence, ...entry, action: item ? 'upsert' : 'remove', ...(item ? { item } : {}) };
+      const payload = JSON.stringify(event), size = Buffer.byteLength(payload);
+      insert.run(sequence, entry.address, payload, size); bytes += size;
+    }
+    this.setMeta('address_sequence', sequence);
+    let count = this.db.prepare('SELECT COUNT(*) AS count FROM address_journal').get().count;
+    let floor = this.addressChangeState().floor;
+    // Retain a contiguous suffix under both event-count and byte bounds.
+    if (count > this.maxAddressEvents || bytes > this.maxAddressBytes) {
+      for (const row of this.db.prepare('SELECT sequence,bytes FROM address_journal ORDER BY sequence').iterate()) {
+        if (count <= this.maxAddressEvents && bytes <= this.maxAddressBytes) break;
+        floor = row.sequence; bytes -= row.bytes; count--;
+      }
+      this.db.prepare('DELETE FROM address_journal WHERE sequence<=?').run(floor);
+      this.setMeta('address_floor', floor);
+    }
+    this.setMeta('address_journal_bytes', bytes);
+  }
+  addressChangesPage(addresses, { after, through, limit, tip }) {
+    pageLimit(limit);
+    const placeholders = addresses.map(() => '?').join(',');
+    const rows = this.db.prepare(`SELECT payload FROM address_journal WHERE address IN (${placeholders})
+      AND sequence>? AND sequence<=? ORDER BY sequence LIMIT ?`).all(...addresses, after, through, limit);
+    return rows.map(row => {
+      const event = JSON.parse(row.payload);
+      if (event.item) {
+        event.item.confirmations = event.item.status === 'pending' ? 0 : tip.height - event.item.block_height + 1;
+        if (event.kind === 'utxo') event.item.mature = !event.item.coinbase || event.item.confirmations >= 100;
+      }
+      return event;
+    });
+  }
   atomic(fn) {
     this.db.exec('BEGIN IMMEDIATE');
     try { const result = fn(); this.db.exec('COMMIT'); return result; }
@@ -189,6 +326,7 @@ export class Store {
       // Transactional semantic-version bump also prevents old binaries from
       // reopening a repaired index and reverting to the old genesis rules.
       this.setMeta('schema', '2');
+      this.resetAddressJournal();
       this.bump();
     });
     return true;
@@ -202,6 +340,7 @@ export class Store {
     if (!Array.isArray(block.tx) || !Number.isSafeInteger(block.mediantime)) throw new Error('Incomplete backend block');
     if (block.height > 0 && this.needsGenesisRepair()) throw new Error('Repair genesis accounting before extending this index');
     const transactions = block.tx.map(normalizeTransaction);
+    const addressTouches = this.newAddressTouches();
     const addresses = new Set();
     const changes = [];
     let resync = false;
@@ -226,7 +365,10 @@ export class Store {
         const totalFor = address => { if (!totals.has(address)) totals.set(address, zeroTotals()); track(address); return totals.get(address); };
         for (const input of tx.inputs) {
           const previous = findOutput.get(input.txid, input.vout);
-          if (previous) totalFor(previous.address).spent += BigInt(previous.amount);
+          if (previous) {
+            totalFor(previous.address).spent += BigInt(previous.amount);
+            this.touchAddress(addressTouches, previous.address, 'utxo', input.txid, input.vout);
+          }
           insertSpend.run(input.txid, input.vout, tx.txid, block.height);
           if (findBounty.get(input.txid, input.vout)) track(null, { type: 'spent', txid: input.txid, vout: input.vout, spending_txid: tx.txid });
         }
@@ -236,13 +378,17 @@ export class Store {
           if (output.address) {
             insertOutput.run(tx.txid, output.vout, output.address, output.amount, block.height, Number(tx.coinbase));
             totalFor(output.address).received += BigInt(output.amount);
+            this.touchAddress(addressTouches, output.address, 'utxo', tx.txid, output.vout);
           }
           if (output.p2c) {
             this.insertBounty(tx, output, block.height);
             track(null, { type: 'added', txid: tx.txid, vout: output.vout, block_hash: block.hash, block_height: block.height });
           }
         }
-        for (const [address, total] of totals) insertHistory.run(address, tx.txid, block.height, position, String(total.received), String(total.spent));
+        for (const [address, total] of totals) {
+          insertHistory.run(address, tx.txid, block.height, position, String(total.received), String(total.spent));
+          this.touchAddress(addressTouches, address, 'history', tx.txid);
+        }
       }
       const minimum = block.height - this.window + 1;
       for (const row of this.db.prepare('SELECT txid,vout FROM bounties WHERE height<?').iterate(minimum)) track(null, { type: 'window_exit', ...row });
@@ -250,6 +396,7 @@ export class Store {
       this.db.prepare('UPDATE blocks SET bounty_indexed=0 WHERE height<? AND bounty_indexed=1').run(minimum);
       for (const row of this.db.prepare('SELECT txid,vout FROM bounties WHERE coinbase=1 AND height=?').iterate(block.height - 99)) track(null, { type: 'matured', ...row });
       if (block.height === 0) this.setMeta('schema', '2');
+      this.appendAddressChanges(addressTouches);
       this.bump();
     });
     return { addresses: [...addresses], bountyChanges: changes, resync };
@@ -281,6 +428,9 @@ export class Store {
       this.db.prepare('DELETE FROM bounties WHERE height=?').run(tip.height);
       this.db.prepare('DELETE FROM transactions WHERE block_height=?').run(tip.height);
       this.db.prepare('DELETE FROM blocks WHERE height=?').run(tip.height);
+      // Conservative explicit resynchronization: never replay obsolete-chain
+      // events as canonical, including after rollback/restart mid-catchup.
+      this.resetAddressJournal();
       this.bump();
     });
     return { addresses: addresses.slice(0, 10000), resync: addresses.length > 10000,
@@ -291,6 +441,11 @@ export class Store {
     const txs = (normalized ? [...rawTransactions] : rawTransactions.map(normalizeTransaction)).sort((a, b) => a.txid.localeCompare(b.txid));
     const fingerprint = createHash('sha256').update(JSON.stringify(txs)).digest('hex');
     if (this.meta('mempool_fingerprint') === fingerprint && this.meta('mempool_tip') === this.tip()?.hash) return { addresses: [], bountyChanges: [] };
+    const addressTouches = this.pendingMutationTouches(txs);
+    const before = new Map([...addressTouches.keys].map(([id, entry]) => {
+      const item = this.addressItem(entry);
+      return [id, item ? JSON.stringify(item) : null];
+    }));
     const addresses = new Set(this.db.prepare('SELECT DISTINCT address FROM pending_history LIMIT 10001').all().map(row => row.address));
     const oldBountySpends = new Map(this.db.prepare('SELECT p.txid,p.vout,p.spender FROM pending_spends p JOIN bounties b USING(txid,vout) LIMIT 10001').all().map(row => [key(row.txid, row.vout), row]));
     const changes = [];
@@ -333,6 +488,7 @@ export class Store {
       }
       this.setMeta('mempool_fingerprint', fingerprint);
       this.setMeta('mempool_tip', this.tip()?.hash ?? '');
+      this.appendAddressChanges(addressTouches, before);
       this.bump();
     });
     return { addresses: [...addresses], bountyChanges: changes, resync };
@@ -443,22 +599,23 @@ export class Store {
       status: row.pending ? 'pending' : 'confirmed', confirmations: row.pending ? 0 : height - row.height + 1,
       coinbase: Boolean(row.coinbase), mature: !row.coinbase || height - row.height + 1 >= 100 }));
   }
-  utxoPage(address, { after = null, limit = 100 } = {}) {
+  utxoPage(address, { after = null, limit = 100, includePendingSpent = false } = {}) {
     pageLimit(limit);
     const [lastTxid, lastVout] = outpointAfter(after);
     const rows = this.db.prepare(`SELECT * FROM (
-      SELECT o.txid,o.vout,o.amount,o.height,o.coinbase,0 AS pending FROM outputs o
+      SELECT o.txid,o.vout,o.amount,o.height,o.coinbase,0 AS pending,p.spender AS pending_spent_by FROM outputs o
         LEFT JOIN spends s ON s.txid=o.txid AND s.vout=o.vout
         LEFT JOIN pending_spends p ON p.txid=o.txid AND p.vout=o.vout
-        WHERE o.address=? AND (o.txid,o.vout)>(?,?) AND s.spender IS NULL AND p.spender IS NULL
-      UNION ALL SELECT o.txid,o.vout,o.amount,NULL,0,1 FROM pending_outputs o
+        WHERE o.address=? AND (o.txid,o.vout)>(?,?) AND s.spender IS NULL AND (? OR p.spender IS NULL)
+      UNION ALL SELECT o.txid,o.vout,o.amount,NULL,0,1,s.spender FROM pending_outputs o
         LEFT JOIN pending_spends s ON s.txid=o.txid AND s.vout=o.vout
-        WHERE o.address=? AND (o.txid,o.vout)>(?,?) AND s.spender IS NULL
-      ) ORDER BY txid,vout LIMIT ?`).all(address, lastTxid, lastVout, address, lastTxid, lastVout, limit);
+        WHERE o.address=? AND (o.txid,o.vout)>(?,?) AND (? OR s.spender IS NULL)
+      ) ORDER BY txid,vout LIMIT ?`).all(address, lastTxid, lastVout, Number(includePendingSpent), address, lastTxid, lastVout, Number(includePendingSpent), limit);
     const height = this.tip()?.height ?? -1;
     return rows.map(row => ({ txid: row.txid, vout: row.vout, amount: row.amount, block_height: row.height,
       status: row.pending ? 'pending' : 'confirmed', confirmations: row.pending ? 0 : height - row.height + 1,
-      coinbase: Boolean(row.coinbase), mature: !row.coinbase || height - row.height + 1 >= 100 }));
+      coinbase: Boolean(row.coinbase), mature: !row.coinbase || height - row.height + 1 >= 100,
+      ...(includePendingSpent ? { pending_spent_by: row.pending_spent_by ?? null } : {}) }));
   }
   transactionLocation(txid) {
     const row = this.db.prepare('SELECT b.hash AS block_hash,t.block_height FROM transactions t JOIN blocks b ON t.block_height=b.height WHERE txid=?').get(txid);

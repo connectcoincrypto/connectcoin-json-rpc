@@ -65,7 +65,9 @@ export class RateLimiter {
     } else {
       // The allowlist, enforced by transport, keeps the method namespace bounded.
       key = `method:${method}`;
-      limit = this.options.methodLimit;
+      // A batch may fetch 32 parents: keep its work quota separate and fixed,
+      // including malformed batches and requests arriving on another socket.
+      limit = method === 'gettransactions' ? Math.min(8, this.options.methodLimit) : this.options.methodLimit;
     }
     let keys = this.ips.get(ip);
     let timestamps = keys?.get(key);

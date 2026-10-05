@@ -2,7 +2,7 @@
 
 This document specifies this repository's API, not ConnectCoin's private node RPC. The transport is raw plaintext TCP: one UTF-8 JSON object followed by a newline. A browser cannot directly use a native TCP socket. Native clients can keep one connection open and correlate responses by `id`.
 
-Only JSON-RPC `"2.0"` requests with an explicit string/safe-integer `id`, a listed method and named object `params` are accepted. `params` may be omitted for `{}`. Extra parameters are errors. Client notifications (missing/null id), batches and arbitrary RPC forwarding are not supported. Subscriptions and streaming use server-originated JSON-RPC notifications.
+Only JSON-RPC `"2.0"` requests with an explicit string/safe-integer `id`, a listed method and named object `params` are accepted. `params` may be omitted for `{}`. Extra parameters are errors. Client notifications (missing/null id), JSON-RPC batch arrays and arbitrary RPC forwarding are not supported. The bounded `gettransactions` method is one ordinary request. Subscriptions and streaming use server-originated JSON-RPC notifications.
 
 ```json
 {"jsonrpc":"2.0","id":1,"method":"getrecentblockhashes","params":{}}
@@ -30,11 +30,34 @@ Every indexed amount is a **base-10 integer string in connects**. One CONN is **
 
 History entries contain `txid`, `status` (`confirmed`/`pending`), `block_height`, `block_hash`, `confirmations`, `received`, `spent` and `balance_delta`. Pending block fields are `null`. `spent` means address-owned input value, not necessarily value paid to another person; change is included in `received`. Confirmations are evaluated at the response's `tip`.
 
-UTXO entries include `txid`, `vout`, `amount`, `block_height`, `status`, `confirmations`, `coinbase`, `mature`. Outputs consumed by indexed mempool transactions are excluded. Unconfirmed outputs can themselves be spent by descendants; only terminal unspent outputs are returned.
+UTXO entries include `txid`, `vout`, `amount`, `block_height`, `status`, `confirmations`, `coinbase`, `mature`. By default, outputs consumed by indexed mempool transactions are excluded. Unconfirmed outputs can themselves be spent by descendants; only terminal unspent outputs are returned. The optional boolean `include_pending_spent:true` also returns confirmed and pending outputs consumed only by indexed mempool transactions, adding `pending_spent_by` (spending txid or `null`) to every item. It never returns outputs spent in the active chain. This opt-in is bound into pagination cursors; do not change it between pages. Clients must exclude marked outputs from automatic coin selection and ordinary available balances. Their presence is information, not evidence that a conflicting replacement will be accepted.
 
 History and UTXO responses have `items`, `tip`, `unit`, `address`, `live:true` and `next_cursor`. Return `next_cursor` unchanged to request the next page. `null` means no further records at that moment. Each page request uses the ordinary method quota. The default page size is 100, configurable up to 500. Cursors are opaque authenticated keyset markers bound to the query, address and a canonical chain anchor. History is ordered by txid ascending; UTXOs by txid then vout ascending, **not by timestamp**. The UI can reorder downloaded history by block height.
 
 Pagination is a **live view**, not a frozen point-in-time database snapshot. New blocks and unrelated mempool activity do not invalidate it. Deleting a preceding row does not skip the next result, as offset pagination would. New records inserted behind the cursor, and updates/removals of already-read records, require a refresh; use address subscriptions, deduplicate by txid/outpoint and refresh on notifications. Do not assume concatenated pages represent an atomic spendable balance. A reorganization removing the cursor's anchor or a service restart invalidates the cursor explicitly (`-32011`); restart the query. This avoids indefinite restarts of large histories under the 60/minute quota and avoids holding database snapshots open for slow clients.
+
+### Incremental address synchronization
+
+`getaddresschanges` accepts `{ "addresses": ["<address>", "<address>"], "cursor": "<opaque cursor>" }`. Supply 1–100 unique native addresses for the indexed network; the order and uniform letter case do not matter. Duplicate normalized addresses and additional fields are rejected. Omit `cursor` (or use `null`) for a **watermark only**, not a historical snapshot. The response is:
+
+```json
+{"tip":{"height":700,"hash":"<64 hex>","mediantime":1700000000,"chain":"main","genesis_hash":"<64 hex>"},"unit":"connects","through_sequence":123,"journal_epoch":1,"changes":[{"sequence":123,"address":"<address>","kind":"utxo","action":"upsert","txid":"<64 hex>","vout":0,"item":{"txid":"<64 hex>","vout":0,"amount":"10000000000","block_height":699,"status":"confirmed","coinbase":false,"pending_spent_by":null,"confirmations":2,"mature":true}}],"next_cursor":"<opaque cursor>","has_more":false}
+```
+
+Every event has a safe-integer global `sequence`, `address`, `kind` (`history` or `utxo`), `action` (`upsert` or `remove`) and `txid`. UTXO events additionally have `vout`. An upsert contains the complete standard history/UTXO record in `item`; a remove omits `item` and deletes that address's txid/outpoint. UTXO upserts always include `pending_spent_by`, including for a pending output consumed by a pending child. Confirmations and maturity are evaluated at the response tip, not the current wall clock. Event sequences are ordered but can have gaps for unrelated addresses. Apply events idempotently in order, recompute confirmation/maturity-dependent values at the supplied tip, and advance the stored cursor only after applying the page successfully. No raw transaction download is needed to apply these indexed deltas.
+
+Race-safe initial synchronization:
+
+1. Get an initial watermark for the complete address set **before** reading any baseline pages.
+2. Read all history pages and UTXO pages with `include_pending_spent:true` into a staging cache. Deduplicate by address+txid and address+outpoint. These baseline pages remain live views.
+3. Replay `getaddresschanges` from the starting watermark until `has_more:false`, applying every upsert and removal. This reconciles mutations that occurred anywhere in the baseline, including behind an already-read keyset marker.
+4. Publish the reconciled cache. On later tips/address notifications, fetch only changes from the saved cursor; do not download all historical pages again. Derive balances from the full pending-aware UTXO set. Outputs with `pending_spent_by` are not ordinary spend candidates.
+
+Each paginated delta drain freezes an upper event sequence and a canonical tip; event payloads are persisted at mutation time, so a later eviction or confirmation cannot rewrite an earlier page. After `has_more:false`, a new call starts the next drain and includes newer mutations. Cursors bind the normalized address set, persistent journal epoch, sequence and canonical chain anchor. Adding/removing an address requires a new baseline for that set. Reorganizations, mutation overflow, incompatible writer gaps or expired retention return `-32011`: discard an incomplete baseline/delta staging pass and resynchronize. An older server returns `-32601`, allowing a client to fall back to legacy refresh behavior. Cursor tokens are opaque and are never authorization or unspentness proofs.
+
+Every response, including initial watermarks and empty deltas, includes safe-integer `through_sequence` (the frozen global upper sequence) and `journal_epoch`. For wallets split across multiple address batches, **all completed batches must have the same tip hash, `journal_epoch` and `through_sequence` before publishing their combined balances**. A matching block hash alone is insufficient: mempool changes can occur between batches without a new block and otherwise double-count a self-transfer. Converge lagging batches with further delta drains, preserving the private staging cache; do not replace ordinary same-epoch drift with full historical rereads. If continuous churn prevents bounded convergence, retain the last coherent published snapshot and retry later instead of publishing a mixture.
+
+The SQLite address journal and its separate signing key persist across normal service restarts. It retains at most 100,000 events or 32 MiB of serialized payloads by default; a single mutation exceeding 10,000 tracked keys explicitly resets the journal instead of dropping partial changes silently. These bounds apply globally, not per address. Pages use the configured address page size (default 100, maximum 500). `getaddresschanges` has its own ordinary **60 calls per sliding minute per IP** quota, regardless of how many addresses are in the request. The existing bounty journal and legacy pagination cursors retain their separate lifetime rules.
 
 ## Bounty streams: no result-count cutoff
 
@@ -86,7 +109,7 @@ Subscription methods return `subscription_id`, `tip` and the current change `cur
 {"jsonrpc":"2.0","method":"subscription","params":{"subscription_id":"<id>","kind":"address","address":"<address>","tip":{},"reorg":false,"refresh":true}}
 ```
 
-Address notifications tell the client to refresh cached balance/history/UTXOs and confirmations; they are not full transaction downloads. Tip notifications contain `kind:"tip"`, `tip`, `reorg`. Bounty notifications contain `kind:"bounties"`, `changes`, `tip`, `cursor`, or an explicit `resync_required:true`. Notifications do not consume request quotas, but subscriptions and output queues are bounded.
+Address notifications tell the client to update cached balance/history/UTXOs and confirmations; incremental clients should replay `getaddresschanges`, while legacy clients refresh their pages. They are not full transaction downloads. Tip notifications contain `kind:"tip"`, `tip`, `reorg`. Bounty notifications contain `kind:"bounties"`, `changes`, `tip`, `cursor`, or an explicit `resync_required:true`. Notifications do not consume request quotas, but subscriptions and output queues are bounded.
 
 ## Full transaction lookup and broadcast
 
@@ -97,6 +120,24 @@ Its `transaction` field preserves ConnectCoin node RPC's decoded schema, includi
 `sendrawtransaction` accepts only `transaction_hex`; it cannot forward RPC options that disable fee safeguards. Default submitted transaction cap is 400,000 bytes. Requests remain subject to the node's standardness, fee and consensus rules. A timeout can have an unknown broadcast outcome; check the locally known txid before retrying. The server does not sign, alter recipient outputs, generate proofs or reserve bounties.
 
 Broadcast is independent of temporary index readiness. An initialized, pinned network identity is required; before forwarding a transaction, the server checks the local node's chain and genesis against that identity. It does not require the address/mempool index to be caught up. Input validation, per-IP quotas, concurrency limits and node fee/consensus checks still apply. A preflight failure explicitly reports that the transaction was not submitted; an error after forwarding may have an unknown outcome and is never automatically rebroadcast by this service.
+
+### Compact transaction batches
+
+`gettransactions` accepts exactly `{ "txids": ["<64 hex>", "<64 hex>"] }`: between 1 and 32 transaction IDs, unique ignoring letter case. Extra fields, duplicate IDs, invalid hashes and empty/oversized arrays return `-32602`. The server normalizes hashes to lowercase and preserves request order. Every ID must exist in the active-chain/mempool index (`-32004` otherwise); no old-chain search, arbitrary block hash, verbose flag or private-node option can be supplied.
+
+The result has exactly the following shape:
+
+```json
+{"tip":{"height":700,"hash":"<64 hex>","mediantime":1700000000,"chain":"main","genesis_hash":"<64 hex>"},"transactions":[{"txid":"<first requested hash>","hex":"<serialized transaction>"}],"remaining":["<next requested hash>"]}
+```
+
+`transactions` is a nonempty ordered prefix of the requested IDs; `remaining` is its exact unreturned suffix. An empty `remaining` completes the group. The complete JSON **result** is at most **1,572,864 bytes (1.5 MiB)**, leaving room for the request ID and JSON-RPC envelope within the default 2 MiB frame. The service fetches each parent with private-node `getrawtransaction` using `verbose:false` and its indexed block hash. It stops at the first item that would exceed the result budget, without fetching the later suffix. Clients can issue another bounded request for `remaining`, subject to the same quota. No decoded input/output history is returned. Clients must independently parse and hash each transaction and verify ownership and amounts before spending it.
+
+If the first transaction cannot fit alone (or its bounded backend response exceeds the limit), the method returns **`-32021`** with `data:{"txid":"<that ID>","max_result_bytes":1572864}`. The client may fall back to existing `gettransaction` for that single ID, whose ordinary response-frame limits still apply, then continue the remaining IDs. A client connected to an older server receives `-32601` and can use individual lookups. Backend failures or invalid hex return `-32002`; the server never returns a successful partial prefix after these failures.
+
+The quota is **eight calls per sliding 60 seconds per actual peer IP**, independent of individual transaction lookups; invalid batch parameters also consume it. Each call performs at most 32 backend transaction reads. Only **two batches globally** can execute; additional calls return `-32030` with `retry_after_ms:1000`. Backend reads run sequentially inside each batch, each with a **five-second deadline** and response-byte cap. A **30-second total batch deadline**, disconnect or service shutdown aborts pending HTTP requests and releases the batch slot. Per-call limits cannot raise the operator's configured backend limits.
+
+Every returned transaction's indexed status, block hash and height are checked after its fetch and again before publication. The starting chain anchor must remain active, and the indexed network identity must remain unchanged. A changed location, reorganized anchor or unavailable coherent index causes `-32011`, with no usable result prefix. Normal chain growth and unrelated mempool changes are allowed when all these checks still pass. As with individual lookups, this is an indexed live view, not an inclusion or unspentness proof.
 
 ## Errors and resource limits
 
@@ -113,6 +154,7 @@ Broadcast is independent of temporary index readiness. An initialized, pinned ne
 | `-32005` | Subscription capacity reached |
 | `-32011` | Expired cursor or invalidated snapshot; resynchronize |
 | `-32020` | Transaction rejected by the node (`data.node_code` identifies its error class) |
+| `-32021` | First transaction exceeds compact batch size limit; try an individual lookup |
 | `-32029` | Rate limit, with `data.retry_after_ms` and `reason` |
 | `-32030` | Server concurrency/queue capacity reached |
 

@@ -67,66 +67,88 @@ export class NodeBackend {
     this.nextId = 1;
   }
 
-  async call(method, params = []) {
+  async call(method, params = [], { signal, timeoutMs = this.timeoutMs, maxResponseBytes = this.maxResponseBytes } = {}) {
     if (!ALLOWED_METHODS.has(method)) throw new BackendError('Backend method is not allowlisted');
-    const credentials = this.cookieFile
-      ? (await readFile(this.cookieFile, 'utf8')).trim()
-      : `${this.username}:${this.password}`;
-    if (!credentials.includes(':') || /[\r\n]/.test(credentials)) throw new BackendError('Invalid backend credentials');
-    const id = this.nextId++;
-    const body = JSON.stringify({ jsonrpc: '2.0', id, method, params });
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      const finish = (error, result) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        if (error) reject(error); else resolve(result);
-      };
-      const request = http.request(this.url, {
-        method: 'POST', agent: this.agent,
-        headers: { Authorization: `Basic ${Buffer.from(credentials).toString('base64')}`,
-          'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
-      }, response => {
-        const chunks = [];
-        let length = 0;
-        response.on('data', chunk => {
-          length += chunk.length;
-          if (length > this.maxResponseBytes) {
-            const error = new BackendError('Backend response exceeds size limit');
-            response.destroy(error); request.destroy(error); finish(error); return;
-          }
-          chunks.push(chunk);
-        });
-        response.on('error', () => finish(new BackendError('Backend response interrupted')));
-        response.on('end', () => {
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || !Number.isSafeInteger(maxResponseBytes) || maxResponseBytes < 1) {
+      throw new BackendError('Invalid backend request limits');
+    }
+    // Per-call limits can only narrow the operator's configured limits. Include
+    // credential reads and agent queueing in the same bounded lifetime.
+    const timeout = new AbortController();
+    const deadline = setTimeout(() => timeout.abort(new BackendError('Backend request timed out', 'TIMEOUT')), Math.min(timeoutMs, this.timeoutMs));
+    const boundedSignal = signal ? AbortSignal.any([signal, timeout.signal]) : timeout.signal;
+    const cancelled = () => boundedSignal.reason instanceof BackendError ? boundedSignal.reason : new BackendError('Backend request cancelled', 'ABORT_ERR');
+    try {
+      if (boundedSignal.aborted) throw cancelled();
+      const credentials = this.cookieFile
+        ? (await readFile(this.cookieFile, { encoding: 'utf8', signal: boundedSignal })).trim()
+        : `${this.username}:${this.password}`;
+      if (boundedSignal.aborted) throw cancelled();
+      if (!credentials.includes(':') || /[\r\n]/.test(credentials)) throw new BackendError('Invalid backend credentials');
+      const id = this.nextId++;
+      const body = JSON.stringify({ jsonrpc: '2.0', id, method, params });
+      return await new Promise((resolve, reject) => {
+        let settled = false;
+        const finish = (error, result) => {
           if (settled) return;
-          let payload;
-          try { payload = parseNodeJson(Buffer.concat(chunks, length).toString('utf8')); }
-          catch { finish(new BackendError(`Invalid backend response (HTTP ${response.statusCode})`)); return; }
-          if (!payload || payload.id !== id) { finish(new BackendError('Backend response ID mismatch')); return; }
-          if (payload.error) {
-            // Do not forward arbitrary backend diagnostics (paths, credentials,
-            // or local operator information) to the public protocol.
-            finish(new BackendError('Backend RPC rejected request', payload.error.code)); return;
-          }
-          if (response.statusCode !== 200 || !Object.hasOwn(payload, 'result')) {
-            finish(new BackendError(`Backend HTTP error ${response.statusCode}`)); return;
-          }
-          finish(null, payload.result);
+          settled = true;
+          boundedSignal.removeEventListener('abort', abort);
+          if (error) reject(error); else resolve(result);
+        };
+        const request = http.request(this.url, {
+          method: 'POST', agent: this.agent,
+          headers: { Authorization: `Basic ${Buffer.from(credentials).toString('base64')}`,
+            'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+        }, response => {
+          const chunks = [];
+          let length = 0;
+          response.on('data', chunk => {
+            length += chunk.length;
+            if (length > Math.min(maxResponseBytes, this.maxResponseBytes)) {
+              const error = new BackendError('Backend response exceeds size limit', 'RESPONSE_TOO_LARGE');
+              response.destroy(error); request.destroy(error); finish(error); return;
+            }
+            chunks.push(chunk);
+          });
+          response.on('error', () => finish(new BackendError('Backend response interrupted')));
+          response.on('end', () => {
+            if (settled) return;
+            let payload;
+            try { payload = parseNodeJson(Buffer.concat(chunks, length).toString('utf8')); }
+            catch { finish(new BackendError(`Invalid backend response (HTTP ${response.statusCode})`)); return; }
+            if (!payload || payload.id !== id) { finish(new BackendError('Backend response ID mismatch')); return; }
+            if (payload.error) {
+              // Do not forward arbitrary backend diagnostics (paths, credentials,
+              // or local operator information) to the public protocol.
+              finish(new BackendError('Backend RPC rejected request', payload.error.code)); return;
+            }
+            if (response.statusCode !== 200 || !Object.hasOwn(payload, 'result')) {
+              finish(new BackendError(`Backend HTTP error ${response.statusCode}`)); return;
+            }
+            finish(null, payload.result);
+          });
         });
+        const abort = () => {
+          const error = cancelled();
+          request.destroy(error); finish(error);
+        };
+        request.on('error', () => finish(new BackendError('Backend connection failed')));
+        boundedSignal.addEventListener('abort', abort, { once: true });
+        if (boundedSignal.aborted) { abort(); return; }
+        request.end(body);
       });
-      const timer = setTimeout(() => {
-        const error = new BackendError('Backend request timed out');
-        request.destroy(error); finish(error);
-      }, this.timeoutMs);
-      request.on('error', () => finish(new BackendError('Backend connection failed')));
-      request.end(body);
-    });
+    } catch (error) {
+      if (boundedSignal.aborted) throw cancelled();
+      throw error;
+    } finally { clearTimeout(deadline); }
   }
 
   transaction(txid, blockHash) {
     return this.call('getrawtransaction', blockHash ? [txid, true, blockHash] : [txid, true]);
+  }
+
+  rawTransaction(txid, blockHash, limits) {
+    return this.call('getrawtransaction', blockHash ? [txid, false, blockHash] : [txid, false], limits);
   }
 
   close() { this.agent.destroy(); }

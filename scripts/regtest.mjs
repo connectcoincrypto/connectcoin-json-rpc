@@ -234,6 +234,7 @@ try {
   const addressSub = await client.request('subscribeaddress', { address: receiver });
   const bountySub = await client.request('subscribebounties');
   const changesStart = (await client.request('getbountychanges')).next_cursor;
+  let addressCursor = (await client.request('getaddresschanges', { addresses: [receiver, receiver2] })).next_cursor;
   progress('Node, initial index and native TCP API ready. Creating typed P2PK/P2C transactions.');
 
   const amount = '1.2345678901';
@@ -258,6 +259,11 @@ try {
   const utxos = (await client.request('getaddressutxos', { address: receiver })).items;
   assert.equal(utxos.length, 1);
   assert.equal(utxos[0].amount, amountConnects);
+  const receivedChanges = await client.request('getaddresschanges', { addresses: [receiver, receiver2], cursor: addressCursor });
+  assert.equal(receivedChanges.has_more, false);
+  assert.ok(receivedChanges.changes.some(event => event.address === receiver && event.kind === 'utxo' && event.item?.txid === paymentTxid));
+  assert.ok(receivedChanges.changes.some(event => event.address === receiver && event.kind === 'history' && event.item?.status === 'confirmed'));
+  addressCursor = receivedChanges.next_cursor;
   const full = await client.request('gettransaction', { txid: paymentTxid });
   assert.equal(full.transaction.txid, paymentTxid);
   assert.equal(full.transaction.vout[utxos[0].vout].value, amount);
@@ -291,6 +297,13 @@ try {
   assert.equal(pending.pending_spent, amountConnects);
   assert.equal(pending.available_confirmed, '0');
   assert.equal((await client.request('getaddressutxos', { address: receiver })).items.length, 0);
+  const pendingAware = await client.request('getaddressutxos', { address: receiver, include_pending_spent: true });
+  assert.equal(pendingAware.items.length, 1); assert.equal(pendingAware.items[0].pending_spent_by, spendingTxid);
+  const pendingChanges = await client.request('getaddresschanges', { addresses: [receiver, receiver2], cursor: addressCursor });
+  assert.equal(pendingChanges.has_more, false);
+  assert.ok(pendingChanges.changes.some(event => event.txid === paymentTxid && event.item?.pending_spent_by === spendingTxid));
+  assert.ok(pendingChanges.changes.some(event => event.address === receiver2 && event.item?.status === 'pending'));
+  addressCursor = pendingChanges.next_cursor;
   assert.equal((await client.request('getaddresshistory', { address: receiver })).items.find(item => item.txid === spendingTxid).status, 'pending');
   assert.equal((await client.request('gettransaction', { txid: spendingTxid })).status, 'pending');
   assert.equal((await client.request('getaddressbalance', { address: receiver2 })).pending_received, '12300000001');
@@ -299,11 +312,17 @@ try {
   assert.equal((await client.request('getaddressbalance', { address: receiver })).confirmed, '0');
   assert.equal((await client.request('getaddressbalance', { address: receiver2 })).confirmed, '12300000001');
   assert.equal((await client.request('getaddresshistory', { address: receiver })).items.find(item => item.txid === spendingTxid).status, 'confirmed');
+  const confirmedChanges = await client.request('getaddresschanges', { addresses: [receiver, receiver2], cursor: addressCursor });
+  assert.equal(confirmedChanges.has_more, false);
+  assert.ok(confirmedChanges.changes.some(event => event.txid === paymentTxid && event.kind === 'utxo' && event.action === 'remove'));
+  assert.ok(confirmedChanges.changes.some(event => event.address === receiver2 && event.item?.status === 'confirmed'));
+  addressCursor = confirmedChanges.next_cursor;
 
   progress('Broadcast/mempool/confirmation passed. Testing invalidate/reconsider recovery.');
   await rpc('invalidateblock', [spendingBlock]);
   await indexer.syncOnce();
   assert.equal((await client.request('getchaintip')).hash, fundingBlock);
+  await assert.rejects(client.request('getaddresschanges', { addresses: [receiver, receiver2], cursor: addressCursor }), error => error.code === -32011);
   assert.equal((await client.request('getaddresshistory', { address: receiver })).items.find(item => item.txid === spendingTxid).status, 'pending');
   await rpc('reconsiderblock', [spendingBlock]);
   await indexer.syncOnce();

@@ -80,7 +80,7 @@ test('cursor signatures reject tampering, restart and oversize input', () => {
 
 test('whitelist excludes private RPC and enforces readiness and params', async () => {
   const f = fixture();
-  assert.equal(METHODS.length, 13);
+  assert.equal(METHODS.length, 15);
   for (const method of ['getblock', 'getblocktemplate', 'stop', 'dumpprivkey', '__proto__']) {
     await assert.rejects(f.api.dispatch(method, {}, f.context), { code: -32601 });
   }

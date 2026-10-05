@@ -62,9 +62,11 @@ All parameters are named objects. Each request must have a string or safe-intege
 | `getrecentblockhashes` | `{}` | Height/hash pairs, newest first, latest 600 including the tip |
 | `getblockbounties` | `block_hash` | Streams **every** bounty created in that active recent block, with current state, without funding transaction bytes |
 | `getaddressbalance` | `address` | Confirmed, immature, pending and available balance fields |
-| `getaddressutxos` | `address`, optional `cursor` | Paginated outputs not spent in the chain or current indexed mempool |
+| `getaddressutxos` | `address`, optional `cursor`, `include_pending_spent` | Paginated outputs; pending-spent entries are opt-in and explicitly marked |
 | `getaddresshistory` | `address`, optional `cursor` | Paginated per-address received/spent/net summaries and confirmation status |
+| `getaddresschanges` | `addresses` (1–100), optional `cursor` | Persistent, block-anchored history/UTXO upserts and removals; no cursor obtains a baseline watermark |
 | `gettransaction` | `txid` | Full decoded transaction and hex from the node, with indexed location |
+| `gettransactions` | `txids` | Compact hex for an ordered prefix of up to 32 indexed transactions, plus remaining IDs |
 | `sendrawtransaction` | `transaction_hex` | Broadcast an already-completed transaction; normal node validation/fee policy applies |
 | `getbountychanges` | optional `cursor` | Bounded, replayable incremental changes; no cursor obtains the starting watermark |
 | `subscribebounties` | `{}` | Bounty-change notifications, or explicit resync notices |
@@ -78,11 +80,14 @@ Only native ConnectCoin P2PK Bech32m addresses are supported. The domain in a P2
 
 | Scope | Sliding 60-second quota |
 |---|---|
-| Every method except `getblockbounties` | **60 per method per IP** |
+| Every method except `getblockbounties` and `gettransactions` | **60 per method per IP** |
+| `gettransactions` (including invalid requests) | **8 per IP**, at most 32 transaction lookups per call |
 | `getblockbounties` for a valid eligible block | **10 per block hash per IP** |
 | Malformed, unknown, stale or out-of-window bounty block requests | **60 combined per IP** |
 
 Counters combine all connections from an IP. Reconnecting does not reset them. Hash letter case and IPv4-mapped IPv6 spellings cannot create extra quotas. An initial request for each of 600 different blocks uses one call from each block's independent quota. Unknown/malformed general requests share a separate 60/minute/IP bucket; they cannot allocate arbitrary method keys. Server notifications do not count as client calls. Rate-limit state is in memory and resets on service restart; use one listener process per public endpoint, or an external shared enforcement layer for multiple replicas. Users behind the same NAT share a quota.
+
+Compact transaction batches are limited to two active calls across all clients, a 30-second total deadline and five seconds per backend call. Their JSON result is at most 1.5 MiB, below the default 2 MiB response frame. Clients continue with the returned `remaining` suffix when a full group does not fit; see [the compact batch contract](docs/protocol.md#compact-transaction-batches).
 
 The limiter's storage is bounded and fails closed at capacity; additional connection/queue/subscription limits can reject requests even below their method quota. These protect memory and concurrent work, and **never silently shorten a successful bounty list**. A client must receive `stream.end` with `complete: true` before treating a block snapshot as complete.
 
