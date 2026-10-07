@@ -80,12 +80,12 @@ Only native ConnectCoin P2PK Bech32m addresses are supported. The domain in a P2
 
 | Scope | Sliding 60-second quota |
 |---|---|
-| Every method except `getblockbounties` and `gettransactions` | **60 per method per IP** |
+| Every allowed method except `getblockbounties` and `gettransactions` | **200 per method per IP** |
 | `gettransactions` (including invalid requests) | **8 per IP**, at most 32 transaction lookups per call |
 | `getblockbounties` for a valid eligible block | **10 per block hash per IP** |
 | Malformed, unknown, stale or out-of-window bounty block requests | **60 combined per IP** |
 
-Counters combine all connections from an IP. Reconnecting does not reset them. Hash letter case and IPv4-mapped IPv6 spellings cannot create extra quotas. An initial request for each of 600 different blocks uses one call from each block's independent quota. Unknown/malformed general requests share a separate 60/minute/IP bucket; they cannot allocate arbitrary method keys. Server notifications do not count as client calls. Rate-limit state is in memory and resets on service restart; use one listener process per public endpoint, or an external shared enforcement layer for multiple replicas. Users behind the same NAT share a quota.
+Counters combine all connections from an IP. Reconnecting does not reset them. Hash letter case and IPv4-mapped IPv6 spellings cannot create extra quotas. An initial request for each of 600 different blocks uses one call from each block's independent quota. Unknown method names share a 60/minute/IP bucket; malformed general requests use another 60/minute/IP bucket. Neither can allocate arbitrary method keys. Invalid parameters for an allowed method consume that method's quota. Server notifications do not count as client calls. Rate-limit state is in memory and resets on service restart; use one listener process per public endpoint, or an external shared enforcement layer for multiple replicas. Users behind the same NAT share a quota.
 
 Compact transaction batches are limited to two active calls across all clients, a 30-second total deadline and five seconds per backend call. Their JSON result is at most 1.5 MiB, below the default 2 MiB response frame. Clients continue with the returned `remaining` suffix when a full group does not fit; see [the compact batch contract](docs/protocol.md#compact-transaction-batches).
 

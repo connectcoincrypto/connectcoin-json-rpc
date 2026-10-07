@@ -13,12 +13,13 @@ test('canonicalizes IPv4, equivalent IPv6 and IPv4-mapped IPv6 addresses', () =>
   assert.equal(canonicalBlockHash('a'.repeat(63)), null);
 });
 
-test('60 calls per method per canonical IP in a sliding window', () => {
+test('200 calls per method per canonical IP in a sliding window', () => {
   let now = 0;
   const rate = new RateLimiter({ now: () => now });
-  for (let n = 0; n < 60; n++) {
-    now = n * 500;
-    assert.equal(rate.consume({ ip: '127.0.0.1', method: 'getchaintip' }).allowed, true);
+  for (let n = 0; n < 200; n++) {
+    now = n * 250;
+    assert.deepEqual(rate.consume({ ip: '127.0.0.1', method: 'getchaintip' }),
+      { allowed: true, remaining: 199 - n, retryAfterMs: 0 });
   }
   assert.equal(rate.consume({ ip: '::ffff:127.0.0.1', method: 'getchaintip' }).allowed, false);
   assert.equal(rate.consume({ ip: '127.0.0.1', method: 'getaddresshistory' }).allowed, true);
@@ -28,6 +29,31 @@ test('60 calls per method per canonical IP in a sliding window', () => {
   now = 60_000;
   assert.equal(rate.consume({ ip: '127.0.0.1', method: 'getchaintip' }).allowed, true);
   assert.equal(rate.consume({ ip: '127.0.0.1', method: 'getchaintip' }).allowed, false);
+});
+
+test('special batch and abuse buckets retain their lower quotas independently', () => {
+  let now = 0;
+  const rate = new RateLimiter({ now: () => now });
+  const consume = method => rate.consume({ ip: '127.0.0.1', method });
+  for (const [method, limit] of [
+    ['gettransactions', 8], ['__invalid_request', 60], ['__unknown_method', 60],
+  ]) {
+    for (let n = 0; n < limit; n++) assert.equal(consume(method).allowed, true);
+    assert.deepEqual(consume(method), { allowed: false, retryAfterMs: 60_000, reason: 'quota' });
+  }
+  for (let n = 0; n < 200; n++) assert.equal(consume('getaddresschanges').allowed, true);
+  assert.equal(consume('getaddresschanges').allowed, false);
+  now = 60_000;
+  for (const method of ['gettransactions', '__invalid_request', '__unknown_method', 'getaddresschanges']) {
+    assert.equal(consume(method).allowed, true);
+  }
+  const strict = new RateLimiter({ methodLimit: 2, now: () => 0 });
+  for (const method of ['gettransactions', '__invalid_request', '__unknown_method']) {
+    const request = { ip: '127.0.0.1', method };
+    assert.equal(strict.consume(request).allowed, true);
+    assert.equal(strict.consume(request).allowed, true);
+    assert.equal(strict.consume(request).allowed, false);
+  }
 });
 
 test('10 requests per block; all 600 distinct blocks fit; invalid blocks share 60', () => {

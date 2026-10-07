@@ -219,14 +219,14 @@ test('broadcast readiness exception does not widen the public method whitelist',
   assert.deepEqual(f.calls, []);
 });
 
-test('TCP broadcasts retain the default 60-per-IP quota across sockets and reconnects while syncing', { timeout: 10000 }, async t => {
+test('TCP broadcasts retain the default 200-per-IP quota across sockets and reconnects while syncing', { timeout: 10000 }, async t => {
   const f = fixture(t);
   const { connect } = await tcpFixture(t, f, { limiter: new RateLimiter({ now: () => 100 }) });
   const first = await connect();
   const second = await connect();
   assert.equal((await first.request('getchaintip')).error.code, -32001);
   assert.equal((await first.request('sendrawtransaction', { transaction_hex: HEX, ip: '192.0.2.1' })).error.code, -32602);
-  for (let n = 1; n < 60; n++) {
+  for (let n = 1; n < 200; n++) {
     const response = await (n % 2 ? first : second).request('sendrawtransaction', { transaction_hex: HEX });
     assert.deepEqual(response.result, { txid: TXID });
   }
@@ -240,7 +240,7 @@ test('TCP broadcasts retain the default 60-per-IP quota across sockets and recon
     assert.ok(response.error.data.retry_after_ms > 0);
   }
   assert.equal(f.calls.length, callsBeforeQuota);
-  assert.equal(f.calls.filter(([method]) => method === 'sendrawtransaction').length, 59);
+  assert.equal(f.calls.filter(([method]) => method === 'sendrawtransaction').length, 199);
   assert.equal((await reconnected.request('getchaintip')).error.code, -32001);
   assert.equal((await reconnected.request('getblockchaininfo')).error.code, -32601);
 });

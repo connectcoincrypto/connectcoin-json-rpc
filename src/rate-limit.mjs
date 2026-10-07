@@ -24,7 +24,7 @@ export function canonicalBlockHash(value) {
 
 /** Sliding-window quotas shared by every socket, with bounded storage. */
 export class RateLimiter {
-  constructor({ windowMs = 60_000, methodLimit = 60, blockLimit = 10,
+  constructor({ windowMs = 60_000, methodLimit = 200, blockLimit = 10,
     invalidBlockLimit = 60, maxIps = 10_000, maxKeysPerIp = 1_024,
     maxKeys = 100_000, now = () => performance.now() } = {}) {
     for (const [key, value] of Object.entries({ windowMs, methodLimit, blockLimit,
@@ -67,7 +67,11 @@ export class RateLimiter {
       key = `method:${method}`;
       // A batch may fetch 32 parents: keep its work quota separate and fixed,
       // including malformed batches and requests arriving on another socket.
-      limit = method === 'gettransactions' ? Math.min(8, this.options.methodLimit) : this.options.methodLimit;
+      if (method === 'gettransactions') limit = Math.min(8, this.options.methodLimit);
+      // Keep the two transport-owned abuse buckets at their existing ceiling.
+      else if (method === '__invalid_request' || method === '__unknown_method') {
+        limit = Math.min(60, this.options.methodLimit);
+      } else limit = this.options.methodLimit;
     }
     let keys = this.ips.get(ip);
     let timestamps = keys?.get(key);
