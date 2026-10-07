@@ -70,7 +70,7 @@ All parameters are named objects. Each request must have a string or safe-intege
 | `sendrawtransaction` | `transaction_hex` | Broadcast an already-completed transaction; normal node validation/fee policy applies |
 | `getbountychanges` | optional `cursor` | Bounded, replayable incremental changes; no cursor obtains the starting watermark |
 | `subscribebounties` | `{}` | Bounty-change notifications, or explicit resync notices |
-| `subscribeaddress` | `address` | Notifications to refresh that address's data/confirmations |
+| `subscribeaddress` | `address`, optional boolean `changes_only` | Address refresh notifications; opt in to actual address changes instead of every new tip |
 | `subscribetip` | `{}` | Tip-change notifications (optional alternative to polling `getchaintip`) |
 | `unsubscribe` | `subscription_id` | Cancel this connection's subscription |
 

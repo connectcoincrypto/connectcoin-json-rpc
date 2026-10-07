@@ -197,13 +197,15 @@ export class Store {
       status: row ? 'confirmed' : 'pending', coinbase: Boolean(row?.coinbase), pending_spent_by: value.pending_spent_by ?? null } : null;
   }
   appendAddressChanges(touches, before = null) {
-    if (touches.overflow) { this.resetAddressJournal(); return; }
+    if (touches.overflow) { this.resetAddressJournal(); return null; }
+    const addresses = new Set();
     let { sequence } = this.addressChangeState();
     let bytes = Number(this.meta('address_journal_bytes'));
     const insert = this.db.prepare('INSERT INTO address_journal VALUES (?,?,?,?)');
     for (const [id, entry] of touches.keys) {
       const item = this.addressItem(entry);
       if (before && (before.get(id) ?? null) === (item ? JSON.stringify(item) : null)) continue;
+      addresses.add(entry.address);
       if (!Number.isSafeInteger(++sequence)) throw new Error('Address journal counter exhausted');
       const event = { sequence, ...entry, action: item ? 'upsert' : 'remove', ...(item ? { item } : {}) };
       const payload = JSON.stringify(event), size = Buffer.byteLength(payload);
@@ -222,6 +224,7 @@ export class Store {
       this.setMeta('address_floor', floor);
     }
     this.setMeta('address_journal_bytes', bytes);
+    return addresses;
   }
   addressChangesPage(addresses, { after, through, limit, tip }) {
     pageLimit(limit);
@@ -395,6 +398,14 @@ export class Store {
       this.db.prepare('DELETE FROM bounties WHERE height<?').run(minimum);
       this.db.prepare('UPDATE blocks SET bounty_indexed=0 WHERE height<? AND bounty_indexed=1').run(minimum);
       for (const row of this.db.prepare('SELECT txid,vout FROM bounties WHERE coinbase=1 AND height=?').iterate(block.height - 99)) track(null, { type: 'matured', ...row });
+      // Maturity changes spendable address funds exactly once, even when this
+      // block has no transaction involving that address. Seek outputs_height;
+      // never scan a subscriber's full history on ordinary tip advancement.
+      for (const row of this.db.prepare(`SELECT o.address,o.txid,o.vout FROM outputs o
+        LEFT JOIN spends s USING(txid,vout) WHERE o.height=? AND o.coinbase=1 AND s.spender IS NULL`).iterate(block.height - 99)) {
+        track(row.address);
+        this.touchAddress(addressTouches, row.address, 'utxo', row.txid, row.vout);
+      }
       if (block.height === 0) this.setMeta('schema', '2');
       this.appendAddressChanges(addressTouches);
       this.bump();
@@ -420,7 +431,13 @@ export class Store {
   rollbackTip() {
     const tip = this.tip();
     if (!tip) return { addresses: [], bountyChanges: [] };
-    const addresses = this.db.prepare('SELECT DISTINCT address FROM history WHERE height=? LIMIT 10001').all(tip.height).map(row => row.address);
+    const addresses = new Set();
+    for (const row of this.db.prepare(`SELECT address FROM history WHERE height=?
+      UNION ALL SELECT o.address FROM outputs o LEFT JOIN spends s USING(txid,vout)
+      WHERE o.height=? AND o.coinbase=1 AND s.spender IS NULL`).iterate(tip.height, tip.height - 99)) {
+      addresses.add(row.address);
+      if (addresses.size > 10000) break;
+    }
     this.atomic(() => {
       this.db.prepare('DELETE FROM spends WHERE height=?').run(tip.height);
       this.db.prepare('DELETE FROM outputs WHERE height=?').run(tip.height);
@@ -433,7 +450,7 @@ export class Store {
       this.resetAddressJournal();
       this.bump();
     });
-    return { addresses: addresses.slice(0, 10000), resync: addresses.length > 10000,
+    return { addresses: [...addresses].slice(0, 10000), resync: addresses.size > 10000,
       bountyChanges: [{ type: 'reorg', removed_block_hash: tip.hash, removed_block_height: tip.height }] };
   }
 
@@ -446,11 +463,10 @@ export class Store {
       const item = this.addressItem(entry);
       return [id, item ? JSON.stringify(item) : null];
     }));
-    const addresses = new Set(this.db.prepare('SELECT DISTINCT address FROM pending_history LIMIT 10001').all().map(row => row.address));
+    const addresses = new Set();
     const oldBountySpends = new Map(this.db.prepare('SELECT p.txid,p.vout,p.spender FROM pending_spends p JOIN bounties b USING(txid,vout) LIMIT 10001').all().map(row => [key(row.txid, row.vout), row]));
     const changes = [];
-    let resync = addresses.size + oldBountySpends.size > 10000;
-    if (resync) addresses.clear();
+    let resync = oldBountySpends.size > 10000;
     const track = (address, change) => {
       if (resync) return;
       if (address) addresses.add(address);
@@ -470,7 +486,7 @@ export class Store {
       const alreadySpent = this.db.prepare('SELECT 1 FROM spends WHERE txid=? AND vout=?');
       for (const tx of txs) {
         const totals = new Map();
-        const totalFor = address => { if (!totals.has(address)) totals.set(address, zeroTotals()); track(address); return totals.get(address); };
+        const totalFor = address => { if (!totals.has(address)) totals.set(address, zeroTotals()); return totals.get(address); };
         for (const input of tx.inputs) {
           if (alreadySpent.get(input.txid, input.vout)) throw new Error('Mempool snapshot conflicts with indexed chain');
           const previous = pending.get(input.txid, input.vout) ?? confirmed.get(input.txid, input.vout);
@@ -488,7 +504,9 @@ export class Store {
       }
       this.setMeta('mempool_fingerprint', fingerprint);
       this.setMeta('mempool_tip', this.tip()?.hash ?? '');
-      this.appendAddressChanges(addressTouches, before);
+      const changedAddresses = this.appendAddressChanges(addressTouches, before);
+      if (changedAddresses === null) { resync = true; addresses.clear(); changes.length = 0; }
+      else for (const address of changedAddresses) track(address);
       this.bump();
     });
     return { addresses: [...addresses], bountyChanges: changes, resync };

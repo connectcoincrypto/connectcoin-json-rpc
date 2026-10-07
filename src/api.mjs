@@ -227,7 +227,8 @@ export class PublicAPI {
       if (sub.kind === 'tip' && (sub.lastTip !== update.tip?.hash)) {
         sub.lastTip = update.tip?.hash;
         notify({ kind: 'tip', tip: update.tip, reorg: Boolean(update.reorg) });
-      } else if (sub.kind === 'address' && (update.reorg || reset || touched.has(sub.address) || sub.lastTip !== update.tip?.hash)) {
+      } else if (sub.kind === 'address' && (update.reorg || update.resync || reset || touched.has(sub.address) ||
+          !sub.changesOnly && sub.lastTip !== update.tip?.hash)) {
         sub.lastTip = update.tip?.hash;
         notify({ kind: 'address', address: sub.address, tip: update.tip, reorg: Boolean(update.reorg), refresh: true });
       } else if (sub.kind === 'bounties' && this.sequence !== start) {
@@ -252,20 +253,23 @@ export class PublicAPI {
 
   subscribe(kind, params, context) {
     const address = kind === 'address' ? normalizeAddress(params.address, this.tip().chain) : undefined;
-    const existing = [...this.subscriptions.values()].find(s => s.context === context && s.kind === kind && s.address === address);
-    if (existing) return { subscription_id: existing.id, tip: this.tip(), cursor: this.changeCursor() };
+    const changesOnly = kind === 'address' && params.changes_only === true;
+    const result = id => ({ subscription_id: id, tip: this.tip(), cursor: this.changeCursor(),
+      ...(changesOnly ? { changes_only: true } : {}) });
+    const existing = [...this.subscriptions.values()].find(s => s.context === context && s.kind === kind && s.address === address && s.changesOnly === changesOnly);
+    if (existing) return result(existing.id);
     let perIP = 0;
     for (const sub of this.subscriptions.values()) if (sub.context.ip === context.ip) perIP++;
     if (perIP >= this.options.maxSubscriptionsPerIP || this.subscriptions.size >= this.options.maxSubscriptions) {
       throw new RpcError(-32005, 'Subscription capacity reached.');
     }
     const id = randomUUID();
-    this.subscriptions.set(id, { id, kind, address, context, lastTip: this.tip().hash });
+    this.subscriptions.set(id, { id, kind, address, changesOnly, context, lastTip: this.tip().hash });
     if (!this.contexts.has(context)) {
       this.contexts.add(context);
       context.onClose(() => { for (const [key, sub] of this.subscriptions) if (sub.context === context) this.subscriptions.delete(key); });
     }
-    return { subscription_id: id, tip: this.tip(), cursor: this.changeCursor() };
+    return result(id);
   }
 
   page(kind, params) {
@@ -418,7 +422,12 @@ export class PublicAPI {
         return { tip: this.tip(), changes, next_cursor: this.changeCursor(seq), has_more: seq < this.sequence };
       }
       case 'subscribebounties': paramsOnly(params, []); return this.subscribe('bounties', params, context);
-      case 'subscribeaddress': paramsOnly(params, ['address']); return this.subscribe('address', params, context);
+      case 'subscribeaddress':
+        paramsOnly(params, ['address', 'changes_only']);
+        if (params.changes_only !== undefined && typeof params.changes_only !== 'boolean') {
+          throw new RpcError(-32602, 'changes_only must be a boolean.');
+        }
+        return this.subscribe('address', params, context);
       case 'subscribetip': paramsOnly(params, []); return this.subscribe('tip', params, context);
     }
   };

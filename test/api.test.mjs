@@ -198,3 +198,35 @@ test('full resync invalidates old feed cursors and signals subscribers', async (
   await assert.rejects(f.api.dispatch('getbountychanges', { cursor: old.next_cursor }, f.context), { code: -32011 });
   assert.equal(f.notices[0].params.resync_required, true);
 });
+
+test('changes-only address subscriptions acknowledge capability and preserve legacy subscriptions', async t => {
+  const f = fixture(); t.after(() => f.api.close());
+  const legacy = await f.api.dispatch('subscribeaddress', { address: ADDRESS }, f.context);
+  const quiet = await f.api.dispatch('subscribeaddress', { address: ADDRESS, changes_only: true }, f.context);
+  assert.deepEqual(Object.keys(legacy).sort(), ['cursor', 'subscription_id', 'tip']);
+  assert.deepEqual(Object.keys(quiet).sort(), ['changes_only', 'cursor', 'subscription_id', 'tip']);
+  assert.equal(quiet.changes_only, true); assert.notEqual(quiet.subscription_id, legacy.subscription_id);
+  assert.equal((await f.api.dispatch('subscribeaddress', { address: ADDRESS, changes_only: false }, f.context)).subscription_id, legacy.subscription_id);
+  assert.equal((await f.api.dispatch('subscribeaddress', { address: ADDRESS, changes_only: true }, f.context)).subscription_id, quiet.subscription_id);
+  const nextTip = { ...f.tip, hash: OTHER, height: f.tip.height + 1 };
+  f.indexer.emit('update', { tip: nextTip, addresses: [], bountyChanges: [] });
+  assert.deepEqual(f.notices.map(n => n.params.subscription_id), [legacy.subscription_id]);
+  f.notices.length = 0;
+  f.indexer.emit('update', { tip: nextTip, addresses: [ADDRESS], bountyChanges: [] });
+  assert.deepEqual(f.notices.map(n => n.params.subscription_id), [legacy.subscription_id, quiet.subscription_id]);
+  assert.deepEqual(Object.keys(f.notices[1].params).sort(), ['address', 'kind', 'refresh', 'reorg', 'subscription_id', 'tip']);
+});
+
+test('changes-only address subscriptions reject nonboolean flags and retain explicit invalidation notices', async t => {
+  const f = fixture(); t.after(() => f.api.close());
+  for (const changes_only of [null, 0, 1, 'true', [], {}]) {
+    await assert.rejects(f.api.dispatch('subscribeaddress', { address: ADDRESS, changes_only }, f.context), { code: -32602 });
+  }
+  await assert.rejects(f.api.dispatch('subscribetip', { changes_only: true }, f.context), { code: -32602 });
+  await f.api.dispatch('subscribeaddress', { address: ADDRESS, changes_only: true }, f.context);
+  for (const invalidation of [{ reorg: true }, { resync: true }, { bountyChanges: [{ type: 'resync_required' }] }]) {
+    f.indexer.emit('update', { tip: f.tip, addresses: [], bountyChanges: [], ...invalidation });
+  }
+  assert.equal(f.notices.length, 3);
+  assert.ok(f.notices.every(n => n.params.refresh === true));
+});
