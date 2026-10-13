@@ -91,6 +91,36 @@ test('whitelist excludes private RPC and enforces readiness and params', async (
   await assert.rejects(f.api.dispatch('getchaintip', {}, f.context), { code: -32001 });
 });
 
+test('recent block counts preserve the default contract and forward bounded suffix sizes', async t => {
+  const f = fixture(); t.after(() => f.api.close());
+  const rows = Array.from({ length: 600 }, (_, i) => ({ height: 650 - i, hash: i.toString(16).padStart(64, '0') }));
+  const counts = [];
+  f.store.recentBlocks = count => { counts.push(count); return rows.slice(0, count); };
+  const legacy = await f.api.dispatch('getrecentblockhashes', {}, f.context);
+  assert.deepEqual(legacy, { tip: f.tip, blocks: rows, window: 600 });
+  for (const count of [1, 5, 100, 600]) {
+    const result = await f.api.dispatch('getrecentblockhashes', { count }, f.context);
+    assert.deepEqual(result, { tip: f.tip, blocks: rows.slice(0, count), window: 600 });
+    assert.deepEqual(Object.keys(result).sort(), ['blocks', 'tip', 'window']);
+  }
+  assert.deepEqual(counts, [600, 1, 5, 100, 600]);
+  assert.equal(f.calls.length, 0);
+});
+
+test('recent block count rejects invalid types, ranges and unknown parameters without querying the store', async t => {
+  const f = fixture(); t.after(() => f.api.close());
+  let calls = 0;
+  f.store.recentBlocks = () => { calls++; return []; };
+  for (const count of [null, undefined, true, false, '5', '', 0, -1, 601, 5.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1, [], {}]) {
+    await assert.rejects(f.api.dispatch('getrecentblockhashes', { count }, f.context), { code: -32602 });
+  }
+  for (const params of [null, [], 5, { count: 5, unknown: true }, { limit: 5 }, { count: 5, window: 1000 }]) {
+    await assert.rejects(f.api.dispatch('getrecentblockhashes', params, f.context), { code: -32602 });
+  }
+  assert.equal(calls, 0);
+  assert.equal(f.calls.length, 0);
+});
+
 test('bounties stream every item, normalize hash, explicitly reject outside window', async () => {
   const f = fixture();
   assert.equal(f.api.classifyBountyHash({ block_hash: HASH.toUpperCase() }), HASH);

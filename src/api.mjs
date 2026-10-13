@@ -378,9 +378,14 @@ export class PublicAPI {
     this.ready();
     switch (method) {
       case 'getchaintip': paramsOnly(params, []); return this.tip();
-      case 'getrecentblockhashes':
-        paramsOnly(params, []);
-        return { tip: this.tip(), blocks: this.store.recentBlocks(), window: 600 };
+      case 'getrecentblockhashes': {
+        paramsOnly(params, ['count']);
+        const count = Object.hasOwn(params, 'count') ? params.count : 600;
+        if (!Number.isSafeInteger(count) || count < 1 || count > 600) {
+          throw new RpcError(-32602, 'Expected count to be an integer between 1 and 600.');
+        }
+        return { tip: this.tip(), blocks: this.store.recentBlocks(count), window: 600 };
+      }
       case 'getblockbounties': {
         paramsOnly(params, ['block_hash']);
         const blockHash = hash(params.block_hash);

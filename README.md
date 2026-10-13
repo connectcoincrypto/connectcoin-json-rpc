@@ -59,7 +59,7 @@ All parameters are named objects. Each request must have a string or safe-intege
 | Method | Parameters | Result |
 |---|---|---|
 | `getchaintip` | `{}` | Indexed active tip: height, hash, median time, chain and genesis identity |
-| `getrecentblockhashes` | `{}` | Height/hash pairs, newest first, latest 600 including the tip |
+| `getrecentblockhashes` | optional integer `count` (1–600; default 600) | Latest `count` height/hash pairs, newest first including the tip; the eligible `window` remains 600 |
 | `getblockbounties` | `block_hash` | Streams **every** bounty created in that active recent block, with current state, without funding transaction bytes |
 | `getaddressbalance` | `address` | Confirmed, immature, pending and available balance fields |
 | `getaddressutxos` | `address`, optional `cursor`, `include_pending_spent` | Paginated outputs; pending-spent entries are opt-in and explicitly marked |

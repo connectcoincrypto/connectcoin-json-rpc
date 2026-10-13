@@ -12,7 +12,11 @@ Only JSON-RPC `"2.0"` requests with an explicit string/safe-integer `id`, a list
 {"jsonrpc":"2.0","id":1,"result":{"tip":{"height":700,"hash":"<64 hex>","mediantime":1700000000,"chain":"testnet4","genesis_hash":"<64 hex>"},"window":600,"blocks":[{"height":700,"hash":"<64 hex>"}]}}
 ```
 
-The example omits other block entries for readability; the actual response contains every available active-chain block from `max(0,H-599)` through `H`, newest first. A block hash is a displayed hexadecimal hash, normalized to lowercase. The server never accepts arbitrary heights or old-chain hashes in `getblockbounties`.
+The example omits other block entries for readability. With `params:{}`, the response remains unchanged: every available active-chain block from `max(0,H-599)` through `H`, newest first. An optional integer `count` between 1 and 600 requests only the newest `min(count,H+1)` entries. For example, `params:{"count":5}` returns heights `H` down through `max(0,H-4)`. `window:600` always describes the bounty eligibility window, **not** the number of returned entries. No new response field is required. Null, booleans, strings, fractions, out-of-range counts and extra parameters are rejected with `-32602`; omitting `count` defaults to 600.
+
+Incremental clients can request 5 entries, then 100 if no returned height/hash matches their cached active chain, and finally 600 if needed. Each request is a separate indexed snapshot: verify the response tip, count, contiguous descending heights and hashes before joining it to cached metadata, and restart reconciliation if the tip changes during the operation. Matching a height alone is insufficient; require the hash at that height too. A short suffix is not a complete 600-block snapshot; if the cache cannot supply the remainder of the current window, refresh with 600. This optimization does not replace bounty-change cursor replay or the full bounty resynchronization required when a cursor expires or a reorganization invalidates it. Older servers reject `count` with `-32602`; clients can retry with `{}` and validate the complete legacy response.
+
+A block hash is a displayed hexadecimal hash, normalized to lowercase. The server never accepts arbitrary heights or old-chain hashes in `getblockbounties`. The optional count does not expand the eligible window, change validation or change per-method rate limits.
 
 ## Amounts and address queries
 

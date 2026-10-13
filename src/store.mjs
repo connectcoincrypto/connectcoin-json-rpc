@@ -255,8 +255,9 @@ export class Store {
     const row = this.db.prepare('SELECT height,hash,mediantime FROM blocks ORDER BY height DESC LIMIT 1').get();
     return row ? { ...row, chain: this.meta('chain'), genesis_hash: this.meta('genesis') } : null;
   }
-  recentBlocks() {
-    return this.db.prepare('SELECT height,hash FROM blocks ORDER BY height DESC LIMIT ?').all(this.window).map(row => ({ ...row }));
+  recentBlocks(count = 600) {
+    if (!Number.isSafeInteger(count) || count < 1 || count > this.window) throw new Error('Invalid recent block count');
+    return this.db.prepare('SELECT height,hash FROM blocks ORDER BY height DESC LIMIT ?').all(count).map(row => ({ ...row }));
   }
   isRecentBlock(hash) {
     return Boolean(this.db.prepare('SELECT 1 FROM blocks WHERE hash=? AND height >= (SELECT MAX(height)-599 FROM blocks)').get(hash));

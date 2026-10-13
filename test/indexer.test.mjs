@@ -163,6 +163,17 @@ test('600-block window is inclusive, metadata is pruned, and rewind rehydrates i
   await indexer.syncOnce();
   assert.equal(store.recentBlocks().length, 600);
   assert.equal(store.recentBlocks().at(-1).height, 2);
+  const expected = chain.slice(-600).reverse().map(({ height, hash }) => ({ height, hash }));
+  assert.deepEqual(store.recentBlocks(), expected);
+  assert.deepEqual(store.recentBlocks(600), expected);
+  for (const count of [1, 5, 100]) {
+    assert.deepEqual(store.recentBlocks(count), expected.slice(0, count));
+    assert.equal(store.window, 600);
+  }
+  for (const count of [null, true, false, '5', '', 0, -1, 601, 5.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1, [], {}]) {
+    assert.throws(() => store.recentBlocks(count), /Invalid recent block count/);
+  }
+  assert.deepEqual(store.recentBlocks(), expected);
   assert.equal(store.isRecentBlock(chain[1].hash), false);
   assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM bounties').get().n, 0);
   backend.chain = chain.slice(0, 601);
@@ -170,6 +181,22 @@ test('600-block window is inclusive, metadata is pruned, and rewind rehydrates i
   assert.equal(store.recentBlocks().at(-1).height, 1);
   assert.equal(store.bountyPage(chain[1].hash).length, 1);
   assert.equal(store.bountyPage(chain[1].hash)[0].status, 'available');
+});
+
+test('recent block suffixes include genesis and return all available entries on short chains', async t => {
+  const chain = [block('suffix-genesis', null)];
+  const store = new Store(); t.after(() => store.close());
+  assert.deepEqual(store.recentBlocks(5), []);
+  const backend = new FakeBackend(chain);
+  const indexer = new Indexer({ backend, store });
+  await indexer.syncOnce();
+  const genesis = [{ height: 0, hash: chain[0].hash }];
+  for (const count of [1, 5, 100, 600]) assert.deepEqual(store.recentBlocks(count), genesis);
+  for (const name of ['suffix-one', 'suffix-two']) chain.push(block(name, chain.at(-1)));
+  await indexer.syncOnce();
+  const expected = chain.toReversed().map(({ height, hash }) => ({ height, hash }));
+  for (const count of [5, 100, 600]) assert.deepEqual(store.recentBlocks(count), expected);
+  assert.deepEqual(store.recentBlocks(1), expected.slice(0, 1));
 });
 
 test('all bounties in a block are retained and available across deterministic pages', async t => {
