@@ -471,7 +471,7 @@ export class PublicAPI {
         return { tip: this.tip(), ...location, transaction };
       }
       case 'getbountychanges': {
-        paramsOnly(params, ['cursor', 'include_bounties', 'known_tip', 'compact', 'known_state']);
+        paramsOnly(params, ['cursor', 'include_bounties', 'known_tip', 'compact', 'known_state', 'compact_version']);
         if (Object.hasOwn(params, 'include_bounties') && typeof params.include_bounties !== 'boolean') {
           throw new RpcError(-32602, 'include_bounties must be a boolean.');
         }
@@ -480,6 +480,10 @@ export class PublicAPI {
         }
         const compact = params.compact === true;
         if (compact && params.include_bounties !== true) throw new RpcError(-32602, 'compact requires include_bounties:true.');
+        if (Object.hasOwn(params, 'compact_version') && (params.compact_version !== 2 || !compact || params.include_bounties !== true)) {
+          throw new RpcError(-32602, 'compact_version must be 2 and requires compact:true and include_bounties:true.');
+        }
+        const compactVersion = params.compact_version ?? 1;
         let knownState;
         if (Object.hasOwn(params, 'known_state')) {
           if (!compact || typeof params.cursor !== 'string' || !Object.hasOwn(params, 'known_tip')) {
@@ -499,24 +503,40 @@ export class PublicAPI {
         // From this tip read through response construction there is no await:
         // the page, suffix counts and cursor belong to one ready publication.
         const tip = this.tip();
-        const expanded = params.include_bounties === true ? { bounty_deltas: 1 } : {};
+        const expanded = params.include_bounties === true && compactVersion === 1 ? { bounty_deltas: 1 } : {};
         if (knownTip) {
-          try { Object.assign(expanded, { block_deltas: 1, block_delta: this.store.bountyBlockDelta(knownTip, tip) }); }
+          try { Object.assign(expanded, { ...(compactVersion === 1 ? { block_deltas: 1 } : {}),
+            block_delta: this.store.bountyBlockDelta(knownTip, tip) }); }
           catch { throw new RpcError(-32011, 'Block bounty index is inconsistent; retry after synchronization.'); }
         }
         if (params.cursor == null) return { tip, changes: [], next_cursor: this.changeCursor(), has_more: false, ...expanded,
-          ...(compact ? { compact: 1, tips: [] } : {}) };
+          ...(compact ? { compact: compactVersion, tips: [] } : {}) };
         const decoded = this.cursors.read(params.cursor);
         if (decoded.kind !== 'changes' || !Number.isSafeInteger(decoded.sequence) || decoded.sequence < this.journalFloor || decoded.sequence > this.sequence) {
           throw new RpcError(-32011, 'Change cursor expired; reload the recent-block snapshot.');
         }
         if (knownState && decoded.sequence === this.sequence && knownTip.height === tip.height && knownTip.hash === tip.hash &&
-            knownState === bountyStateDigest(tip, params.cursor)) return { compact: 1, unchanged: true };
+            knownState === bountyStateDigest(tip, params.cursor)) return { compact: compactVersion, unchanged: true };
         const entries = this.journal.filter(e => e.event.sequence > decoded.sequence).slice(0, this.options.pageSize);
         const seq = entries.at(-1)?.event.sequence ?? decoded.sequence;
-        const payload = compact ? { compact: 1, ...compactBountyEvents(entries) }
+        const payload = compact ? { compact: compactVersion, ...compactBountyEvents(entries, { version: compactVersion, currentTip: tip }) }
           : { changes: entries.map(e => params.include_bounties === true ? { ...e.event, bounty: e.bounty, tip: e.tip } : e.event) };
-        return { tip, ...payload, next_cursor: this.changeCursor(seq), has_more: seq < this.sequence, ...expanded };
+        let responseTip = tip, nextCursor = this.changeCursor(seq);
+        // Compact request references are allowed only after authenticating the
+        // cursor and independently rebuilding its complete canonical base tip.
+        // A valid cursor alone does not authenticate the client's cached network
+        // identity or median time. Never compress a reorg/unknown suffix.
+        if (compactVersion === 2 && knownState && knownTip && expanded.block_delta) {
+          const anchor = this.store.blockAt(knownTip.height);
+          if (anchor?.hash === knownTip.hash && Number.isSafeInteger(anchor.mediantime) && anchor.mediantime >= 0 &&
+              knownState === bountyStateDigest({ ...anchor, chain: tip.chain, genesis_hash: tip.genesis_hash }, params.cursor)) {
+            responseTip = [tip.height, tip.hash, tip.mediantime];
+            expanded.block_delta = expanded.block_delta.blocks.map(block =>
+              [block.height === tip.height && block.hash === tip.hash ? null : block.hash, block.bounty_count]);
+            if (entries.length === 0 && seq === this.sequence && nextCursor === params.cursor) nextCursor = null;
+          }
+        }
+        return { tip: responseTip, ...payload, next_cursor: nextCursor, has_more: seq < this.sequence, ...expanded };
       }
       case 'subscribebounties': paramsOnly(params, []); return this.subscribe('bounties', params, context);
       case 'subscribeaddress':

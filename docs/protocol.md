@@ -133,7 +133,7 @@ The in-memory shared change journal defaults to 10,000 events or 8 MiB, whicheve
 
 ### Compact bounty feed
 
-Optional `compact:true` requires `include_bounties:true`. Full compact responses preserve `tip`, `next_cursor`, `has_more`, `bounty_deltas:1` and any requested `block_deltas`/`block_delta`, and add `compact:1` and `tips:[]`. `tips` is a page-local table of exact historical publication tips, deduplicated in first-occurrence order. Each event replaces its `tip` with an integer zero-based `tip_ref` into that table. The outer current tip is not implicitly table entry zero; it appears there only if an event was published at that tip. The empty event list has an empty table.
+Optional `compact:true` requires `include_bounties:true`. Without `compact_version`, the version-1 contract in this section applies unchanged. Full compact responses preserve `tip`, `next_cursor`, `has_more`, `bounty_deltas:1` and any requested `block_deltas`/`block_delta`, and add `compact:1` and `tips:[]`. `tips` is a page-local table of exact historical publication tips, deduplicated in first-occurrence order. Each event replaces its `tip` with an integer zero-based `tip_ref` into that table. The outer current tip is not implicitly table entry zero; it appears there only if an event was published at that tip. The empty event list has an empty table.
 
 Every event preserves its legacy fields, sequence and outpoint. An `added` event carries its complete `bounty` row, even when the final coherent row is already spent. A `window_exit` event retains `bounty:null`. The status events `pending_spend`, `spent`, `available_again` and `matured` instead omit `bounty` and carry:
 
@@ -173,6 +173,41 @@ Canonical digest test vectors:
 
 - `['bounty-state-v1','main','a'.repeat(64),123,'b'.repeat(64),1700000000,'opaque-cursor-v1']` hashes to `a028924ae24da57f10b87198d8ae90f660bcf67ad7e09e80985e744f42d8a5a7`.
 - `['bounty-immutable-v1','c'.repeat(64),2,'d'.repeat(64),120,'100000000','example.com','e'.repeat(64),1,7,false]` hashes to `49ef00b7fa42a74c1576f41c0e4d9fbc1cc08025b0785bdd12e0736a8f8d3b73`.
+
+### Compact bounty feed version 2
+
+Add **exactly** `compact_version:2` to a request with `compact:true` and `include_bounties:true`. Other version values and incompatible flags are invalid (`-32602`). Omitting the version keeps every version-1 field and meaning unchanged; this is not a server-wide setting. Every v2 response explicitly acknowledges `compact:2`. The v1 digest algorithms above remain unchanged: the digest binds the reconstructed full tip and actual opaque cursor, never an abbreviated wire representation.
+
+V2 non-ACK pages retain `tip`, `changes`, `tips`, `next_cursor` and `has_more`. They omit the redundant `bounty_deltas` and `block_deltas` capability fields: `compact:2` implies enriched bounty deltas, and the presence of `block_delta` acknowledges the requested canonical suffix. If no `known_tip` was requested, `block_delta` is absent. This does not permit treating an absent suffix as an empty block list. The exact unchanged ACK is `{ "compact": 2, "unchanged": true }`, with all v1 authentication, snapshot-generation and publication-fence requirements retained.
+
+**Self-contained versus request-bound pages.** Initial requests, requests without an authenticated matching full-state digest, and requests whose canonical suffix is unavailable return a full tip object, a string cursor, and (when requested) the ordinary `block_delta` object or `null`. No network identity or block ancestry may be inferred from the client's cache for this fallback.
+
+A page is request-bound only after authenticating and range-checking the request cursor, obtaining a complete non-null suffix of at most five canonical indexed blocks from `known_tip`, and reconstructing the base tip from `store.blockAt(known_tip.height)` plus the current pinned chain/genesis identity. The base hash must equal `known_tip.hash`; its median time and the opaque request cursor must produce exactly `known_state`. A cursor by itself is insufficient. These checks and response construction occur without an intervening await, against the same ready publication. A reorg, expired cursor, missing index data or false zero count must never be compressed into apparent continuity.
+
+Only a bound page uses these representations, **together**:
+
+- `tip: [height, hash, mediantime]`. Inherit only `chain` and `genesis_hash` from the fully validated, privately owned state used for this exact outstanding request. Validate the resulting complete tip normally.
+- `block_delta: [[hash, bounty_count], ...]`. Heights are consecutive from `request.known_tip.height + 1`. The list has zero to five pairs, and its endpoint must equal the response height. An empty list is valid only when the base and response tip are the same canonical block. Each count remains a nonnegative safe integer covering **all** bounty creation outputs, not only available ones. `null` is allowed instead of a hash only in the **last** pair whose inferred height equals the response tip height; it references `response.tip.hash`. It never means unknown, missing or empty. All intermediate hashes must be present.
+- `next_cursor: null` only when there are no events, `has_more:false`, and the response cursor is exactly the request cursor. It means preserve that authenticated cursor, not initialize or advance it. All other pages carry a string cursor, including every page containing events.
+
+For example, an otherwise unchanged journal advancing one empty block can return:
+
+```json
+{"tip":[702,"<new block hash>",1700000020],"compact":2,"changes":[],"tips":[],"next_cursor":null,"has_more":false,"block_delta":[[null,0]]}
+```
+
+The zero still has the same authoritative indexed-count requirements as an ordinary suffix. A client must validate the complete array shapes, safe integers, ancestry, endpoint, counts and cache generation before applying aliases. Mixed bound/unbound tip and suffix forms, unknown versions, unsupported null references, and stale request generations are errors, not signals to accept cached data or advance the cursor.
+
+**Event representation, in both bound and self-contained v2 pages:**
+
+- `tip_ref:-1` means the complete response tip, but only when the event's exact historical publication tip matches it in height, hash, median time, chain and genesis. Otherwise the nonnegative index references `tips[]`, whose entries remain full publication tip objects. The table excludes entries represented by `-1`; historical tips are not replaced with the current tip.
+- An `added` event carries the complete nested `bounty` row and omits the four duplicate outer fields `txid`, `vout`, `block_hash`, and `block_height`. Before encoding, the server checks that all four original outer fields exist and equal their nested counterparts. The client validates the complete row and reconstructs those identities before the ordinary event/canonical-count checks. It must reject unexpected mixed duplicate identities instead of silently discarding contradictory values. New rows still carry every monetary, target, certificate, algorithm, coinbase and mutable state field.
+- A state event may replace its outer `spending_txid` with **exactly** `spending_txid_ref:true` only if the original outer property existed and equaled `bounty_delta.spending_txid`. Resolve it to that validated delta value. An absent original outer property remains absent; differing outer and final spenders remain separate values. The boolean alias and an explicit outer spender may not coexist, and false/nonboolean aliases are invalid. Neither the event type nor an absent alias authorizes inferring a spender.
+- State events still carry explicit `txid`/`vout`, the same `bounty_ref` digest and all three delta fields. `window_exit` still carries its explicit outpoint and `bounty:null`. Sequence ordering, cache identity, row validity, confirmation arithmetic, canonical membership, immutable counts and window bounds remain mandatory.
+
+When a v2 request gets an older server's `-32602`, a client may retry the **same unadvanced cursor** with only `compact_version` removed to negotiate v1. A malformed or contradictory successful v2 result must never trigger a permissive downgrade. If an unknown immutable bounty reference requires the existing full-row replay, remove `compact_version` along with `compact` and `known_state`. Keep the original cursor and all snapshot/publication fences. No v2 encoding changes journal storage, retention, quotas, subscription formats, reconciliation or broadcast validation.
+
+### Subscriptions
 
 Subscription methods return `subscription_id`, `tip` and the current change `cursor`. An address subscription requested with `changes_only:true` additionally returns `changes_only:true` as an explicit capability acknowledgement. The legacy request (omitting the flag or setting it to `false`) keeps the original three-field result. Repeating the same subscription and mode on the same connection reuses it; legacy and changes-only address subscriptions are distinct. Subscriptions belong to that connection and are deleted on disconnect. IDs cannot cancel another connection's subscriptions.
 
