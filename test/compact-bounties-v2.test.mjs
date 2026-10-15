@@ -38,7 +38,7 @@ function fixture(t, options = {}) {
 
 test('compact v2 requires an exact opt-in version and compatible flags', async t => {
   const f = fixture(t);
-  for (const compact_version of [null, false, true, 0, 1, 3, '2', [], {}, 2.1]) {
+  for (const compact_version of [null, false, true, 0, 1, 4, '2', [], {}, 2.1]) {
     await assert.rejects(f.initial({ compact_version }), { code: -32602 });
   }
   for (const params of [{ compact_version: 2 }, { compact_version: 2, compact: true },

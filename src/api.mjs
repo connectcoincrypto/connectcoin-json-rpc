@@ -480,8 +480,8 @@ export class PublicAPI {
         }
         const compact = params.compact === true;
         if (compact && params.include_bounties !== true) throw new RpcError(-32602, 'compact requires include_bounties:true.');
-        if (Object.hasOwn(params, 'compact_version') && (params.compact_version !== 2 || !compact || params.include_bounties !== true)) {
-          throw new RpcError(-32602, 'compact_version must be 2 and requires compact:true and include_bounties:true.');
+        if (Object.hasOwn(params, 'compact_version') && (![2, 3].includes(params.compact_version) || !compact || params.include_bounties !== true)) {
+          throw new RpcError(-32602, 'compact_version must be 2 or 3 and requires compact:true and include_bounties:true.');
         }
         const compactVersion = params.compact_version ?? 1;
         let knownState;
@@ -509,8 +509,16 @@ export class PublicAPI {
             block_delta: this.store.bountyBlockDelta(knownTip, tip) }); }
           catch { throw new RpcError(-32011, 'Block bounty index is inconsistent; retry after synchronization.'); }
         }
-        if (params.cursor == null) return { tip, changes: [], next_cursor: this.changeCursor(), has_more: false, ...expanded,
-          ...(compact ? { compact: compactVersion, tips: [] } : {}) };
+        const encodeDefaults = page => {
+          if (compactVersion !== 3) return page;
+          if (page.changes?.length === 0) delete page.changes;
+          if (page.tips?.length === 0) delete page.tips;
+          if (page.has_more === false) delete page.has_more;
+          if (page.next_cursor === null) delete page.next_cursor;
+          return page;
+        };
+        if (params.cursor == null) return encodeDefaults({ tip, changes: [], next_cursor: this.changeCursor(), has_more: false, ...expanded,
+          ...(compact ? { compact: compactVersion, tips: [] } : {}) });
         const decoded = this.cursors.read(params.cursor);
         if (decoded.kind !== 'changes' || !Number.isSafeInteger(decoded.sequence) || decoded.sequence < this.journalFloor || decoded.sequence > this.sequence) {
           throw new RpcError(-32011, 'Change cursor expired; reload the recent-block snapshot.');
@@ -519,24 +527,29 @@ export class PublicAPI {
             knownState === bountyStateDigest(tip, params.cursor)) return { compact: compactVersion, unchanged: true };
         const entries = this.journal.filter(e => e.event.sequence > decoded.sequence).slice(0, this.options.pageSize);
         const seq = entries.at(-1)?.event.sequence ?? decoded.sequence;
-        const payload = compact ? { compact: compactVersion, ...compactBountyEvents(entries, { version: compactVersion, currentTip: tip }) }
-          : { changes: entries.map(e => params.include_bounties === true ? { ...e.event, bounty: e.bounty, tip: e.tip } : e.event) };
         let responseTip = tip, nextCursor = this.changeCursor(seq);
+        let boundBase;
         // Compact request references are allowed only after authenticating the
         // cursor and independently rebuilding its complete canonical base tip.
         // A valid cursor alone does not authenticate the client's cached network
         // identity or median time. Never compress a reorg/unknown suffix.
-        if (compactVersion === 2 && knownState && knownTip && expanded.block_delta) {
+        if (compactVersion >= 2 && knownState && knownTip && expanded.block_delta) {
           const anchor = this.store.blockAt(knownTip.height);
           if (anchor?.hash === knownTip.hash && Number.isSafeInteger(anchor.mediantime) && anchor.mediantime >= 0 &&
               knownState === bountyStateDigest({ ...anchor, chain: tip.chain, genesis_hash: tip.genesis_hash }, params.cursor)) {
+            boundBase = { ...anchor, chain: tip.chain, genesis_hash: tip.genesis_hash };
             responseTip = [tip.height, tip.hash, tip.mediantime];
             expanded.block_delta = expanded.block_delta.blocks.map(block =>
               [block.height === tip.height && block.hash === tip.hash ? null : block.hash, block.bounty_count]);
             if (entries.length === 0 && seq === this.sequence && nextCursor === params.cursor) nextCursor = null;
+            if (compactVersion === 3 && ['height', 'hash', 'mediantime', 'chain', 'genesis_hash']
+              .every(field => boundBase[field] === tip[field])) responseTip = null;
           }
         }
-        return { tip: responseTip, ...payload, next_cursor: nextCursor, has_more: seq < this.sequence, ...expanded };
+        const payload = compact ? { compact: compactVersion, ...compactBountyEvents(entries,
+          { version: compactVersion, currentTip: tip, baseTip: boundBase }) }
+          : { changes: entries.map(e => params.include_bounties === true ? { ...e.event, bounty: e.bounty, tip: e.tip } : e.event) };
+        return encodeDefaults({ tip: responseTip, ...payload, next_cursor: nextCursor, has_more: seq < this.sequence, ...expanded });
       }
       case 'subscribebounties': paramsOnly(params, []); return this.subscribe('bounties', params, context);
       case 'subscribeaddress':
