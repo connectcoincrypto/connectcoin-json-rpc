@@ -59,17 +59,17 @@ All parameters are named objects. Each request must have a string or safe-intege
 | Method | Parameters | Result |
 |---|---|---|
 | `getchaintip` | `{}` | Indexed active tip: height, hash, median time, chain and genesis identity |
-| `getrecentblockhashes` | optional integer `count` (1–600; default 600) | Latest `count` height/hash pairs, newest first including the tip; the eligible `window` remains 600 |
+| `getrecentblockhashes` | optional integer `count` (1–600; default 600), boolean `include_bounty_counts` | Latest `count` height/hash pairs, newest first; opt in to complete indexed creation counts, including empty blocks; `window` remains 600 |
 | `getblockbounties` | `block_hash` | Streams **every** bounty created in that active recent block, with current state, without funding transaction bytes |
 | `getaddressbalance` | `address` | Confirmed, immature, pending and available balance fields |
 | `getaddressutxos` | `address`, optional `cursor`, `include_pending_spent` | Paginated outputs; pending-spent entries are opt-in and explicitly marked |
 | `getaddresshistory` | `address`, optional `cursor` | Paginated per-address received/spent/net summaries and confirmation status |
 | `getaddresschanges` | `addresses` (1–100), optional `cursor` | Persistent, block-anchored history/UTXO upserts and removals; no cursor obtains a baseline watermark |
-| `gettransaction` | `txid` | Full decoded transaction and hex from the node, with indexed location |
+| `gettransaction` | `txid`, optional boolean `raw_only` | Full decoded transaction by default, or only `transaction:{hex}` when opted in; same indexed envelope and location revalidation |
 | `gettransactionstatus` | `txid` | Indexed pending/confirmed status, canonical block location and confirmations; no transaction bytes or node lookup |
 | `gettransactions` | `txids` | Compact hex for an ordered prefix of up to 32 indexed transactions, plus remaining IDs |
 | `sendrawtransaction` | `transaction_hex` | Broadcast an already-completed transaction; normal node validation/fee policy applies |
-| `getbountychanges` | optional `cursor`, boolean `include_bounties`, `known_tip:{height,hash}` | Bounded, replayable incremental changes; opt in to complete bounty rows and publication tips, plus a canonical suffix of up to five blocks with complete bounty counts; no cursor obtains the starting watermark |
+| `getbountychanges` | optional `cursor`, boolean `include_bounties`, `known_tip:{height,hash}`, boolean `compact`, `known_state` | Replayable deltas and optional canonical suffix; compact mode references immutable bounty metadata and publication tips, with a full-state-bound unchanged acknowledgement |
 | `subscribebounties` | `{}` | Bounty-change notifications, or explicit resync notices |
 | `subscribeaddress` | `address`, optional boolean `changes_only` | Address refresh notifications; opt in to actual address changes instead of every new tip |
 | `subscribetip` | `{}` | Tip-change notifications (optional alternative to polling `getchaintip`) |
@@ -91,6 +91,8 @@ Counters combine all connections from an IP. Reconnecting does not reset them. H
 Compact transaction batches are limited to two active calls across all clients, a 30-second total deadline and five seconds per backend call. Their JSON result is at most 1.5 MiB, below the default 2 MiB response frame. Clients continue with the returned `remaining` suffix when a full group does not fit; see [the compact batch contract](docs/protocol.md#compact-transaction-batches).
 
 `gettransactionstatus` and `getbountychanges` each use the ordinary independent 200/minute/IP quota. Set `include_bounties:true` and check `bounty_deltas:1` to apply complete indexed bounty deltas without reloading each changed block. Each event preserves its full row and tip at publication, including across pagination; `window_exit` removes the outpoint. With that flag, optional `known_tip:{height,hash}` also requests `block_deltas:1` and a bounded canonical block suffix. A complete indexed block with `bounty_count:0` needs no empty bounty stream; nonempty blocks still require their full snapshot. A `null` suffix requires the ordinary recent-window reconciliation. For confirmation polling, `gettransactionstatus` reads only the coherent local index and never downloads the transaction or proof witness. These are indexed state reports, not inclusion proofs; see [the protocol](docs/protocol.md) for initial synchronization and explicit resync handling.
+
+All traffic-saving modes are opt-in; omitted or false flags retain the legacy payloads. `getrecentblockhashes` with `include_bounty_counts:true` acknowledges `bounty_counts:1` and supplies the same authoritative counts for the initial/recovery window. `getbountychanges` with `compact:true` requires `include_bounties:true`: status changes bind cached immutable metadata by SHA-256, and per-page tip references retain each event's historical publication. Unknown references require replay of the same cursor without compact mode; a conflicting known reference is an error, not permission to overwrite metadata. The optional `known_state` digest binds the full validated tip and cursor, allowing only an exactly unchanged checkpoint to return `{compact:1,unchanged:true}`. See [the compact feed contract](docs/protocol.md#compact-bounty-feed) for encodings and mandatory checks. `gettransaction` with `raw_only:true` omits unused decoded data but never omits raw transaction validation or the post-fetch location fence.
 
 The limiter's storage is bounded and fails closed at capacity; additional connection/queue/subscription limits can reject requests even below their method quota. These protect memory and concurrent work, and **never silently shorten a successful bounty list**. A client must receive `stream.end` with `complete: true` before treating a block snapshot as complete.
 

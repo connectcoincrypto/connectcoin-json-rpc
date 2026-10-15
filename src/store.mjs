@@ -259,6 +259,23 @@ export class Store {
     if (!Number.isSafeInteger(count) || count < 1 || count > this.window) throw new Error('Invalid recent block count');
     return this.db.prepare('SELECT height,hash FROM blocks ORDER BY height DESC LIMIT ?').all(count).map(row => ({ ...row }));
   }
+  recentBlocksWithBountyCounts(count, tip) {
+    if (!Number.isSafeInteger(count) || count < 1 || count > this.window || !tip ||
+        !Number.isSafeInteger(tip.height) || tip.height < 0) throw new Error('Invalid recent bounty block request');
+    validHash(tip.hash);
+    if (this.blockAt(tip.height)?.hash !== tip.hash || this.tip()?.hash !== tip.hash) {
+      throw new Error('Inconsistent recent bounty block tip');
+    }
+    const rows = this.db.prepare(`SELECT height,hash,bounty_indexed,
+      (SELECT COUNT(*) FROM bounties WHERE bounties.height=blocks.height) AS bounty_count
+      FROM blocks ORDER BY height DESC LIMIT ?`).all(count);
+    if (rows.length !== Math.min(count, tip.height + 1) || rows[0]?.hash !== tip.hash ||
+        rows.some((row, index) => row.height !== tip.height - index || row.bounty_indexed !== 1 ||
+          !Number.isSafeInteger(row.bounty_count) || row.bounty_count < 0 || !HASH.test(row.hash))) {
+      throw new Error('Incomplete recent bounty block manifest');
+    }
+    return rows.map(({ height, hash, bounty_count }) => ({ height, hash, bounty_count }));
+  }
   isRecentBlock(hash) {
     return Boolean(this.db.prepare('SELECT 1 FROM blocks WHERE hash=? AND height >= (SELECT MAX(height)-599 FROM blocks)').get(hash));
   }

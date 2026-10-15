@@ -3,6 +3,7 @@ import { setImmediate as yieldLoop } from 'node:timers/promises';
 import { RpcError } from './errors.mjs';
 import { Cursors } from './cursor.mjs';
 import { normalizeAddress } from './address.mjs';
+import { bountyStateDigest, compactBountyEvents } from './bounty-codec.mjs';
 
 export const METHODS = Object.freeze([
   'getchaintip', 'getrecentblockhashes', 'getblockbounties',
@@ -385,10 +386,18 @@ export class PublicAPI {
     switch (method) {
       case 'getchaintip': paramsOnly(params, []); return this.tip();
       case 'getrecentblockhashes': {
-        paramsOnly(params, ['count']);
+        paramsOnly(params, ['count', 'include_bounty_counts']);
         const count = Object.hasOwn(params, 'count') ? params.count : 600;
         if (!Number.isSafeInteger(count) || count < 1 || count > 600) {
           throw new RpcError(-32602, 'Expected count to be an integer between 1 and 600.');
+        }
+        if (Object.hasOwn(params, 'include_bounty_counts') && typeof params.include_bounty_counts !== 'boolean') {
+          throw new RpcError(-32602, 'include_bounty_counts must be a boolean.');
+        }
+        if (params.include_bounty_counts === true) {
+          const tip = this.tip();
+          try { return { tip, blocks: this.store.recentBlocksWithBountyCounts(count, tip), window: 600, bounty_counts: 1 }; }
+          catch { throw new RpcError(-32011, 'Block bounty index is inconsistent; retry after synchronization.'); }
         }
         return { tip: this.tip(), blocks: this.store.recentBlocks(count), window: 600 };
       }
@@ -436,23 +445,47 @@ export class PublicAPI {
         return { tip, txid, status: 'confirmed', block_hash, block_height, confirmations: tip.height - block_height + 1 };
       }
       case 'gettransaction': {
-        paramsOnly(params, ['txid']);
+        paramsOnly(params, ['txid', 'raw_only']);
+        if (Object.hasOwn(params, 'raw_only') && typeof params.raw_only !== 'boolean') {
+          throw new RpcError(-32602, 'raw_only must be a boolean.');
+        }
         const txid = hash(params.txid);
         const location = this.store.transactionLocation(txid);
         if (!location) throw new RpcError(-32004, 'Transaction not found in the current index or mempool.');
         let transaction;
-        try { transaction = await this.backend.transaction(txid, location.block_hash); }
+        try {
+          if (params.raw_only === true) {
+            const hex = await this.backend.rawTransaction(txid, location.block_hash, { signal: context.signal });
+            if (typeof hex !== 'string' || hex.length < 20 || hex.length % 2 || !/^[0-9a-fA-F]+$/.test(hex)) {
+              throw new Error('Invalid raw transaction');
+            }
+            transaction = { hex };
+          } else transaction = await this.backend.transaction(txid, location.block_hash);
+        }
         catch { throw new RpcError(-32002, 'Transaction unavailable from the backend; retry after synchronization.'); }
         const currentLocation = this.store.transactionLocation(txid);
-        if (!this.indexer.ready || currentLocation?.status !== location.status || currentLocation?.block_hash !== location.block_hash) {
+        if (!this.indexer.ready || currentLocation?.status !== location.status || currentLocation?.block_hash !== location.block_hash ||
+            params.raw_only === true && currentLocation?.block_height !== location.block_height) {
           throw new RpcError(-32011, 'Transaction state changed; retry this query.');
         }
         return { tip: this.tip(), ...location, transaction };
       }
       case 'getbountychanges': {
-        paramsOnly(params, ['cursor', 'include_bounties', 'known_tip']);
+        paramsOnly(params, ['cursor', 'include_bounties', 'known_tip', 'compact', 'known_state']);
         if (Object.hasOwn(params, 'include_bounties') && typeof params.include_bounties !== 'boolean') {
           throw new RpcError(-32602, 'include_bounties must be a boolean.');
+        }
+        if (Object.hasOwn(params, 'compact') && typeof params.compact !== 'boolean') {
+          throw new RpcError(-32602, 'compact must be a boolean.');
+        }
+        const compact = params.compact === true;
+        if (compact && params.include_bounties !== true) throw new RpcError(-32602, 'compact requires include_bounties:true.');
+        let knownState;
+        if (Object.hasOwn(params, 'known_state')) {
+          if (!compact || typeof params.cursor !== 'string' || !Object.hasOwn(params, 'known_tip')) {
+            throw new RpcError(-32602, 'known_state requires compact:true, a cursor and known_tip.');
+          }
+          knownState = hash(params.known_state);
         }
         let knownTip;
         if (Object.hasOwn(params, 'known_tip')) {
@@ -471,15 +504,19 @@ export class PublicAPI {
           try { Object.assign(expanded, { block_deltas: 1, block_delta: this.store.bountyBlockDelta(knownTip, tip) }); }
           catch { throw new RpcError(-32011, 'Block bounty index is inconsistent; retry after synchronization.'); }
         }
-        if (params.cursor == null) return { tip, changes: [], next_cursor: this.changeCursor(), has_more: false, ...expanded };
+        if (params.cursor == null) return { tip, changes: [], next_cursor: this.changeCursor(), has_more: false, ...expanded,
+          ...(compact ? { compact: 1, tips: [] } : {}) };
         const decoded = this.cursors.read(params.cursor);
         if (decoded.kind !== 'changes' || !Number.isSafeInteger(decoded.sequence) || decoded.sequence < this.journalFloor || decoded.sequence > this.sequence) {
           throw new RpcError(-32011, 'Change cursor expired; reload the recent-block snapshot.');
         }
-        const changes = this.journal.filter(e => e.event.sequence > decoded.sequence).slice(0, this.options.pageSize)
-          .map(e => params.include_bounties === true ? { ...e.event, bounty: e.bounty, tip: e.tip } : e.event);
-        const seq = changes.at(-1)?.sequence ?? decoded.sequence;
-        return { tip, changes, next_cursor: this.changeCursor(seq), has_more: seq < this.sequence, ...expanded };
+        if (knownState && decoded.sequence === this.sequence && knownTip.height === tip.height && knownTip.hash === tip.hash &&
+            knownState === bountyStateDigest(tip, params.cursor)) return { compact: 1, unchanged: true };
+        const entries = this.journal.filter(e => e.event.sequence > decoded.sequence).slice(0, this.options.pageSize);
+        const seq = entries.at(-1)?.event.sequence ?? decoded.sequence;
+        const payload = compact ? { compact: 1, ...compactBountyEvents(entries) }
+          : { changes: entries.map(e => params.include_bounties === true ? { ...e.event, bounty: e.bounty, tip: e.tip } : e.event) };
+        return { tip, ...payload, next_cursor: this.changeCursor(seq), has_more: seq < this.sequence, ...expanded };
       }
       case 'subscribebounties': paramsOnly(params, []); return this.subscribe('bounties', params, context);
       case 'subscribeaddress':

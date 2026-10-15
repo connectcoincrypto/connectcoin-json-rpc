@@ -18,6 +18,8 @@ Incremental clients can request 5 entries, then 100 if no returned height/hash m
 
 A block hash is a displayed hexadecimal hash, normalized to lowercase. The server never accepts arbitrary heights or old-chain hashes in `getblockbounties`. The optional count does not expand the eligible window, change validation or change per-method rate limits.
 
+Optional boolean `include_bounty_counts:true` adds `bounty_counts:1` to this response and `bounty_count` to **every** returned block. It counts all P2C creation outputs in that canonical block, including spent, pending-spent and immature outputs, exactly like the complete block snapshot. The tip, descending contiguous block list and counts are obtained synchronously from one ready indexed state. Missing metadata, an indexing gap, an unindexed block or an inconsistent tip returns `-32011`, never an inferred zero. An indexed zero authorizes an empty snapshot only for that exact hash. Positive counts still require the complete block stream; clients validate its unique output count and retain the ordinary initial watermark, replay and final publication fences. The `count` range and inclusive 600-block window are unchanged. Omitting the flag or using `false` preserves the original payload; nonboolean flags return `-32602`. An older server can reject the flag, requiring ordinary full streams instead of assuming missing counts mean zero.
+
 ## Amounts and address queries
 
 Every indexed amount is a **base-10 integer string in connects**. One CONN is **10,000,000,000 connects**, not Bitcoin's 100,000,000 satoshis. Use arbitrary-precision integers in clients. Strings prevent JavaScript/JSON's 53-bit precision limit from silently changing values.
@@ -129,6 +131,49 @@ A validated zero-count entry permits installing an empty block snapshot **for th
 
 The in-memory shared change journal defaults to 10,000 events or 8 MiB, whichever is reached first. The byte bound includes the private saved bounty rows and publication tips even when only legacy clients are connected. Old cursors, service restarts, missing required rows, large catchup and reorganizations require full resynchronization; they cannot silently skip events. A poll receives error `-32011`; a subscriber receives `resync_required:true`. Reorganizations discard the old journal before any further delta response, so disconnected-chain events are not replayed as current. If the connection is lost, resume from the last processed cursor or take a fresh snapshot if it expired. `getbountychanges` keeps its ordinary independent 200 calls per sliding minute per IP quota, with either flag value.
 
+### Compact bounty feed
+
+Optional `compact:true` requires `include_bounties:true`. Full compact responses preserve `tip`, `next_cursor`, `has_more`, `bounty_deltas:1` and any requested `block_deltas`/`block_delta`, and add `compact:1` and `tips:[]`. `tips` is a page-local table of exact historical publication tips, deduplicated in first-occurrence order. Each event replaces its `tip` with an integer zero-based `tip_ref` into that table. The outer current tip is not implicitly table entry zero; it appears there only if an event was published at that tip. The empty event list has an empty table.
+
+Every event preserves its legacy fields, sequence and outpoint. An `added` event carries its complete `bounty` row, even when the final coherent row is already spent. A `window_exit` event retains `bounty:null`. The status events `pending_spend`, `spent`, `available_again` and `matured` instead omit `bounty` and carry:
+
+```json
+{"bounty_ref":"<64 hex SHA-256>","bounty_delta":{"status":"pending_spend","spending_txid":"<claim txid>","confirmations":12},"tip_ref":0}
+```
+
+`bounty_ref` is the lowercase hexadecimal SHA-256 of the UTF-8 bytes of `JSON.stringify` applied to this **exact positional array**, with no numeric/string coercion:
+
+```javascript
+['bounty-immutable-v1', bounty.txid, bounty.vout,
+ bounty.block_hash, bounty.block_height, bounty.amount, bounty.domain,
+ bounty.connection_work_target, bounty.root_certificates_version,
+ bounty.signature_algorithms_mask, bounty.coinbase]
+```
+
+The immutable record must already have been fully validated for that outpoint and canonical block. A client checks the digest, overlays only the three mutable fields, resolves `tip_ref`, and performs all ordinary full-row, confirmation, membership and publication checks. If the referenced outpoint is unknown, replay from the **same unadvanced cursor** without `compact` and `known_state` to obtain the full rows. A mismatch against a known validated immutable record is an error, not permission to replace it. Never infer the final status from the event type or reconstruct the root event's `spending_txid` from `bounty_delta.spending_txid`: coalesced publications can legitimately differ. The server retains full historical rows and tips internally; compact encoding does not change journal retention, ordering, invalidation, subscriptions or quotas.
+
+To avoid repeating an unchanged checkpoint, a compact request with a non-null string `cursor` and `known_tip` may also include `known_state`, a 64-character hexadecimal SHA-256 (letter case is accepted and normalized). Compute it from the **complete previously validated tip and that exact cursor**:
+
+```javascript
+SHA256(JSON.stringify(['bounty-state-v1', tip.chain, tip.genesis_hash,
+ tip.height, tip.hash, tip.mediantime, cursor])) // UTF-8 input, hex output
+```
+
+Only after checking readiness, cursor authentication/type/range/floor, the indexed canonical anchor, equality to the current sequence, equality of `known_tip` to the current tip, and equality of this full-state digest may the server return the exact result:
+
+```json
+{"compact":1,"unchanged":true}
+```
+
+This is the **only** successful feed result allowed to omit tip/cursor/events. The authenticated cursor also binds the server instance's signing key and journal lifetime; a restart, reset, reorg or expired cursor still requires normal resynchronization. Any new event prevents the ACK, even if the bounty later returns to its former state. A changed median time or network identity under an otherwise identical height/hash cannot be hidden by this ACK. A digest mismatch returns the complete compact response, preserving the client's usual metadata checks.
+
+The client may accept the ACK only for the exact outstanding request and unchanged validated cache generation from which it derived the digest. It preserves that complete snapshot and cursor; it does not synthesize a missing count, create a new empty block or advance a watermark. If there was intervening asynchronous snapshot work, the ordinary replay/fence requirement still applies. No cursor or cache may be advanced on an unknown or malformed compact response. `known_state` without `compact:true`, `include_bounties:true`, `known_tip` and a string cursor is invalid (`-32602`). Omitting `compact` or setting it to `false` retains the old full/legacy shape. On an older server's `-32602`, clients may remove `compact` and `known_state` together and retry the same cursor with the earlier capability negotiation.
+
+Canonical digest test vectors:
+
+- `['bounty-state-v1','main','a'.repeat(64),123,'b'.repeat(64),1700000000,'opaque-cursor-v1']` hashes to `a028924ae24da57f10b87198d8ae90f660bcf67ad7e09e80985e744f42d8a5a7`.
+- `['bounty-immutable-v1','c'.repeat(64),2,'d'.repeat(64),120,'100000000','example.com','e'.repeat(64),1,7,false]` hashes to `49ef00b7fa42a74c1576f41c0e4d9fbc1cc08025b0785bdd12e0736a8f8d3b73`.
+
 Subscription methods return `subscription_id`, `tip` and the current change `cursor`. An address subscription requested with `changes_only:true` additionally returns `changes_only:true` as an explicit capability acknowledgement. The legacy request (omitting the flag or setting it to `false`) keeps the original three-field result. Repeating the same subscription and mode on the same connection reuses it; legacy and changes-only address subscriptions are distinct. Subscriptions belong to that connection and are deleted on disconnect. IDs cannot cancel another connection's subscriptions.
 
 `subscribeaddress` accepts `{ "address": "<address>", "changes_only": true }` to receive notifications for that address's confirmed receives/spends, changed mempool state (including eviction/replacement), and unspent coinbase outputs reaching 100 confirmations. Ordinary new blocks and unrelated mempool changes do not notify this mode, even when the address already has pending transactions. Confirmation counts can be advanced locally from a separately obtained tip when needed. With the flag omitted or `false`, notifications still include every new tip for legacy confirmation tracking. Other flag types return `-32602`. A client requiring changes-only behavior must check for the `changes_only:true` acknowledgement; older servers reject the extra parameter and must not be silently retried in legacy mode.
@@ -158,6 +203,8 @@ This method performs no backend transaction lookup and returns no serialized tra
 `gettransaction` looks up the requested txid in the local active-chain/mempool index, then asks the node for that transaction with its known block hash. No `txindex` is required. Unknown/disconnected transactions are not searched by scanning the chain.
 
 Its `transaction` field preserves ConnectCoin node RPC's decoded schema, including `hex`. **Exception to indexed units:** monetary fields inside this raw-node transaction object (`value`, `fee`, etc.) are exact decimal strings in **CONN**, because this is the node's schema. The envelope supplies indexed confirmation/location metadata. Clients must independently parse/hash transactions if they intend to verify the data.
+
+Optional boolean `raw_only:true` retains that same indexed envelope but returns `transaction:{"hex":"<serialized transaction>"}` only. The backend request uses `getrawtransaction` with verbosity `false`, so unused decoded inputs/outputs and duplicated witness fields are neither downloaded nor forwarded. The server validates nonempty even-length hexadecimal encoding and rechecks readiness and the transaction's indexed status, block hash and block height after the fetch. A changed location returns `-32011`; malformed bytes or backend failures return sanitized `-32002`. The ordinary backend and response-frame limits still apply, and disconnect cancellation is forwarded to the backend; the broadcast-only 400,000-byte cap is not a new read limit. Clients must still parse the full bytes, verify txid and P2C fields, and perform every existing funding validation. Omission or `false` preserves the verbose response, nonboolean flags return `-32602`, and an older server may be retried without the flag. This mode uses the same independent 200/minute/IP `gettransaction` quota, not the lower batch quota.
 
 `sendrawtransaction` accepts only `transaction_hex`; it cannot forward RPC options that disable fee safeguards. Default submitted transaction cap is 400,000 bytes. Requests remain subject to the node's standardness, fee and consensus rules. A timeout can have an unknown broadcast outcome; check the locally known txid before retrying. The server does not sign, alter recipient outputs, generate proofs or reserve bounties.
 
