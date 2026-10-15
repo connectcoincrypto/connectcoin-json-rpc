@@ -263,6 +263,31 @@ export class Store {
     return Boolean(this.db.prepare('SELECT 1 FROM blocks WHERE hash=? AND height >= (SELECT MAX(height)-599 FROM blocks)').get(hash));
   }
   blockAt(height) { return this.db.prepare('SELECT height,hash,mediantime FROM blocks WHERE height=?').get(height) ?? null; }
+  bountyBlockDelta(base, tip) {
+    // This bounded suffix is read synchronously with the API's journal/tip.
+    // An unindexed block is unknown, never an empty block. Count creation
+    // outputs, including spent/pending/immature ones, just like bountyPageAfter.
+    if (!base || !tip || !Number.isSafeInteger(base.height) || base.height < 0 ||
+        !Number.isSafeInteger(tip.height) || tip.height < 0) throw new Error('Invalid bounty block delta height');
+    validHash(base.hash); validHash(tip.hash);
+    if (this.blockAt(tip.height)?.hash !== tip.hash || this.tip()?.hash !== tip.hash) {
+      throw new Error('Inconsistent bounty block delta tip');
+    }
+    const distance = tip.height - base.height;
+    if (distance < 0 || distance > 5) return null;
+    const anchor = this.db.prepare('SELECT hash,bounty_indexed FROM blocks WHERE height=?').get(base.height);
+    if (!anchor || anchor.hash !== base.hash) return null;
+    if (anchor.bounty_indexed !== 1) throw new Error('Incomplete bounty block delta anchor');
+    const rows = this.db.prepare(`SELECT height,hash,bounty_indexed,
+      (SELECT COUNT(*) FROM bounties WHERE bounties.height=blocks.height) AS bounty_count
+      FROM blocks WHERE height>? AND height<=? ORDER BY height`).all(base.height, tip.height);
+    if (rows.length !== distance || rows.some((row, index) => row.height !== base.height + index + 1 ||
+        row.bounty_indexed !== 1 || !Number.isSafeInteger(row.bounty_count) || row.bounty_count < 0 ||
+        typeof row.hash !== 'string' || !HASH.test(row.hash)) ||
+        (rows.length && rows.at(-1).hash !== tip.hash)) throw new Error('Incomplete bounty block delta suffix');
+    return { base_height: base.height, base_hash: base.hash,
+      blocks: rows.map(({ height, hash, bounty_count }) => ({ height, hash, bounty_count })) };
+  }
   missingBountyBlocks() {
     return this.db.prepare('SELECT height,hash FROM blocks WHERE bounty_indexed=0 AND height >= (SELECT MAX(height)-599 FROM blocks) ORDER BY height').all();
   }

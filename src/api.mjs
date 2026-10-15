@@ -450,12 +450,28 @@ export class PublicAPI {
         return { tip: this.tip(), ...location, transaction };
       }
       case 'getbountychanges': {
-        paramsOnly(params, ['cursor', 'include_bounties']);
+        paramsOnly(params, ['cursor', 'include_bounties', 'known_tip']);
         if (Object.hasOwn(params, 'include_bounties') && typeof params.include_bounties !== 'boolean') {
           throw new RpcError(-32602, 'include_bounties must be a boolean.');
         }
+        let knownTip;
+        if (Object.hasOwn(params, 'known_tip')) {
+          if (params.include_bounties !== true) throw new RpcError(-32602, 'known_tip requires include_bounties:true.');
+          paramsOnly(params.known_tip, ['height', 'hash']);
+          if (!Number.isSafeInteger(params.known_tip.height) || params.known_tip.height < 0) {
+            throw new RpcError(-32602, 'known_tip.height must be a nonnegative safe integer.');
+          }
+          knownTip = { height: params.known_tip.height, hash: hash(params.known_tip.hash) };
+        }
+        // From this tip read through response construction there is no await:
+        // the page, suffix counts and cursor belong to one ready publication.
+        const tip = this.tip();
         const expanded = params.include_bounties === true ? { bounty_deltas: 1 } : {};
-        if (params.cursor == null) return { tip: this.tip(), changes: [], next_cursor: this.changeCursor(), has_more: false, ...expanded };
+        if (knownTip) {
+          try { Object.assign(expanded, { block_deltas: 1, block_delta: this.store.bountyBlockDelta(knownTip, tip) }); }
+          catch { throw new RpcError(-32011, 'Block bounty index is inconsistent; retry after synchronization.'); }
+        }
+        if (params.cursor == null) return { tip, changes: [], next_cursor: this.changeCursor(), has_more: false, ...expanded };
         const decoded = this.cursors.read(params.cursor);
         if (decoded.kind !== 'changes' || !Number.isSafeInteger(decoded.sequence) || decoded.sequence < this.journalFloor || decoded.sequence > this.sequence) {
           throw new RpcError(-32011, 'Change cursor expired; reload the recent-block snapshot.');
@@ -463,7 +479,7 @@ export class PublicAPI {
         const changes = this.journal.filter(e => e.event.sequence > decoded.sequence).slice(0, this.options.pageSize)
           .map(e => params.include_bounties === true ? { ...e.event, bounty: e.bounty, tip: e.tip } : e.event);
         const seq = changes.at(-1)?.sequence ?? decoded.sequence;
-        return { tip: this.tip(), changes, next_cursor: this.changeCursor(seq), has_more: seq < this.sequence, ...expanded };
+        return { tip, changes, next_cursor: this.changeCursor(seq), has_more: seq < this.sequence, ...expanded };
       }
       case 'subscribebounties': paramsOnly(params, []); return this.subscribe('bounties', params, context);
       case 'subscribeaddress':

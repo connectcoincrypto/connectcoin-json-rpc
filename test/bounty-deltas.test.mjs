@@ -46,6 +46,145 @@ function fixture(t, options = {}) {
   return { store, indexer, api, calls, notices, context, publish, mine, pool, funding, genesisTx, changes, receipt };
 }
 
+const knownTip = store => ({ height: store.tip().height, hash: store.tip().hash });
+const withBlocks = (f, base, cursor) => f.api.dispatch('getbountychanges', {
+  include_bounties: true, known_tip: base, ...(cursor === undefined ? {} : { cursor }),
+}, f.context);
+
+test('block deltas are opt-in and an unchanged canonical tip acknowledges an empty suffix', async t => {
+  const f = fixture(t), base = knownTip(f.store);
+  const plain = await f.changes();
+  assert.equal(Object.hasOwn(plain, 'block_delta'), false);
+  assert.equal(Object.hasOwn(plain, 'block_deltas'), false);
+  const result = await withBlocks(f, { ...base, hash: base.hash.toUpperCase() });
+  assert.equal(result.block_deltas, 1);
+  assert.deepEqual(result.block_delta, { base_height: base.height, base_hash: base.hash, blocks: [] });
+  assert.deepEqual(result.changes, []);
+  assert.equal(result.has_more, false);
+  assert.deepEqual(f.calls, []);
+});
+
+test('block delta parameters reject malformed or non-opted-in anchors', async t => {
+  const f = fixture(t), base = knownTip(f.store);
+  for (const value of [null, undefined, [], '', 0, true, {}, { height: base.height }, { hash: base.hash },
+    { ...base, extra: 1 }, ...[-1, 1.5, true, '1', NaN, Infinity, Number.MAX_SAFE_INTEGER + 1].map(height => ({ ...base, height })),
+    ...[null, 1, '', 'x'.repeat(64), 'a'.repeat(63)].map(hash => ({ ...base, hash }))]) {
+    await assert.rejects(withBlocks(f, value), { code: -32602 });
+  }
+  for (const include_bounties of [false, undefined]) {
+    await assert.rejects(f.api.dispatch('getbountychanges', { known_tip: base,
+      ...(include_bounties === undefined ? {} : { include_bounties }) }, f.context), { code: -32602 });
+  }
+});
+
+test('block delta suffix is bounded to five blocks and ordered oldest to newest', async t => {
+  const f = fixture(t), base = knownTip(f.store), expected = [];
+  for (let i = 1; i <= 5; i++) {
+    f.publish(f.mine(`inline-empty-${i}`));
+    expected.push({ ...knownTip(f.store), bounty_count: 0 });
+  }
+  const page = await withBlocks(f, base);
+  assert.deepEqual(page.block_delta, { base_height: base.height, base_hash: base.hash, blocks: expected });
+  assert.equal(page.tip.hash, expected.at(-1).hash);
+  f.publish(f.mine('inline-sixth'));
+  const distant = await withBlocks(f, base);
+  assert.equal(distant.block_deltas, 1);
+  assert.equal(distant.block_delta, null);
+  assert.equal((await withBlocks(f, { height: Number.MAX_SAFE_INTEGER, hash: base.hash })).block_delta, null);
+  assert.deepEqual(f.calls, []);
+});
+
+test('block bounty counts include spent pending and immature creation outputs', async t => {
+  const f = fixture(t), base = { height: 0, hash: hash('genesis') };
+  const spent = transaction('inline-spent', [native], [{ txid: f.funding.txid, vout: 0 }]);
+  const immature = transaction('inline-coinbase', [bounty], [{ coinbase: '02' }]);
+  f.publish(f.mine('inline-counts', [immature, spent]));
+  f.pool([transaction('inline-pending', [native], [{ txid: f.funding.txid, vout: 1 }])]);
+  const result = await withBlocks(f, base);
+  assert.deepEqual(result.block_delta.blocks.map(block => block.bounty_count), [2, 1]);
+  assert.deepEqual(f.store.bountyPage(hash('funding-block')).map(row => row.status), ['spent', 'pending_spend']);
+  assert.equal(f.store.bountyPage(hash('inline-counts'))[0].status, 'immature');
+  for (const block of result.block_delta.blocks) assert.equal(block.bounty_count, [...f.store.bounties(block.hash)].length);
+  // Mempool removal changes availability, not immutable creation counts.
+  f.pool([]);
+  assert.deepEqual((await withBlocks(f, base)).block_delta, result.block_delta);
+});
+
+test('a same-height different hash never authorizes an empty suffix', async t => {
+  const f = fixture(t), base = knownTip(f.store), cursor = (await f.changes()).next_cursor;
+  f.publish(f.store.rollbackTip());
+  f.publish(f.mine('replacement-at-anchor'));
+  assert.equal(f.store.tip().height, base.height);
+  const replacement = await withBlocks(f, base);
+  assert.equal(replacement.block_deltas, 1);
+  assert.equal(replacement.block_delta, null);
+  await assert.rejects(withBlocks(f, base, cursor), { code: -32011 });
+  assert.equal((await withBlocks(f, { height: 0, hash: hash('wrong-genesis') })).block_delta, null);
+});
+
+test('unindexed suffix and anchor blocks cannot masquerade as zero bounty blocks', async t => {
+  const f = fixture(t), base = knownTip(f.store);
+  f.publish(f.mine('index-not-ready'));
+  f.store.db.prepare('UPDATE blocks SET bounty_indexed=0 WHERE height=?').run(base.height + 1);
+  await assert.rejects(withBlocks(f, base), { code: -32011 });
+  f.store.db.prepare('UPDATE blocks SET bounty_indexed=1 WHERE height=?').run(base.height + 1);
+  f.store.db.prepare('UPDATE blocks SET bounty_indexed=0 WHERE height=?').run(base.height);
+  await assert.rejects(withBlocks(f, base), { code: -32011 });
+  // Even an unchanged base must have a complete indexed identity.
+  f.store.db.prepare('UPDATE blocks SET bounty_indexed=0 WHERE height=?').run(base.height + 1);
+  await assert.rejects(withBlocks(f, knownTip(f.store)), { code: -32011 });
+});
+
+test('missing intermediate blocks fail closed instead of yielding a shorter manifest', async t => {
+  const f = fixture(t), base = knownTip(f.store);
+  for (let i = 0; i < 3; i++) f.publish(f.mine(`inline-hole-${i}`));
+  f.store.db.prepare('DELETE FROM blocks WHERE height=?').run(base.height + 1);
+  await assert.rejects(withBlocks(f, base), { code: -32011 });
+});
+
+test('block suffix readiness and tip identity are checked without backend access', async t => {
+  const f = fixture(t), base = knownTip(f.store);
+  f.indexer.ready = false;
+  await assert.rejects(withBlocks(f, base), { code: -32001 });
+  f.indexer.ready = true;
+  assert.throws(() => f.store.bountyBlockDelta(base, { ...f.store.tip(), hash: hash('forged-tip') }), /Inconsistent/);
+  assert.throws(() => f.store.bountyBlockDelta({ height: -1, hash: base.hash }, f.store.tip()), /Invalid/);
+  assert.deepEqual(f.calls, []);
+});
+
+test('tip journal cursor and block suffix are captured before any queued publication', async t => {
+  const f = fixture(t), base = knownTip(f.store), cursor = (await f.changes()).next_cursor;
+  f.publish(f.mine('coherent-first', [transaction('coherent-new-bounty', [bounty])]));
+  const capturedTip = f.store.tip();
+  queueMicrotask(() => f.publish(f.mine('coherent-next', [transaction('coherent-later-bounty', [bounty],
+    [{ txid: hash('coherent-distinct-input'), vout: 0 }])])));
+  const page = await withBlocks(f, base, cursor);
+  assert.deepEqual(page.tip, capturedTip);
+  assert.equal(page.has_more, false);
+  assert.deepEqual(page.block_delta.blocks, [{ height: capturedTip.height, hash: capturedTip.hash, bounty_count: 1 }]);
+  assert.equal(page.changes.length, 1);
+  assert.deepEqual(page.changes[0].tip, capturedTip);
+  const next = await withBlocks(f, { height: capturedTip.height, hash: capturedTip.hash }, page.next_cursor);
+  assert.equal(next.changes.length, 1);
+  assert.equal(next.block_delta.blocks.length, 1);
+  assert.equal(next.tip.height, capturedTip.height + 1);
+});
+
+test('each journal page advertises a current suffix while preserving historical events', async t => {
+  const f = fixture(t, { pageSize: 1 }), base = knownTip(f.store), cursor = (await f.changes()).next_cursor;
+  const both = transaction('inline-two-events', [native], [0, 1].map(vout => ({ txid: f.funding.txid, vout })));
+  f.pool([both]);
+  const first = await withBlocks(f, base, cursor);
+  assert.equal(first.has_more, true);
+  assert.deepEqual(first.block_delta.blocks, []);
+  f.publish(f.mine('inline-page-next-tip'));
+  const second = await withBlocks(f, base, first.next_cursor);
+  assert.equal(second.has_more, false);
+  assert.equal(second.changes[0].tip.hash, base.hash);
+  assert.equal(second.block_delta.blocks[0].hash, second.tip.hash);
+  assert.equal(second.block_delta.blocks[0].bounty_count, 0);
+});
+
 test('expanded bounty feed acknowledges capability and preserves legacy polling and subscriptions', async t => {
   const f = fixture(t);
   const baseline = await f.changes();
