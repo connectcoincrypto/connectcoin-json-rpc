@@ -105,7 +105,17 @@ Suggested race-safe synchronization:
 
 Changes include `added` (outpoint and creation block), `spent`/`pending_spend` (outpoint and spending txid), `available_again`, `matured`, and `window_exit`. These events tell clients what to refresh; an `added` event does not contain the whole block's bounty list. Query the indicated block for its authoritative current records. Batch changes for the same block rather than issuing one request per outpoint. A window exit is discovery removal, not consensus expiry.
 
-The in-memory shared change journal defaults to 10,000 events or 8 MiB, whichever is reached first. Old cursors, service restarts, large catchup and reorganizations require full resynchronization; they cannot silently skip events. A poll receives error `-32011`; a subscriber receives `resync_required:true`. If the connection is lost, resume from the last processed cursor or take a fresh snapshot if it expired.
+To apply changes directly, pass the optional boolean `include_bounties:true` to `getbountychanges`, including the initial watermark call. Every opted-in result adds `bounty_deltas:1`; clients must check this acknowledgement. Each returned event keeps the legacy fields and adds `bounty` (the complete standard bounty row) and `tip` (that event's original publication tip):
+
+```json
+{"tip":{"height":701,"hash":"<current hash>","mediantime":1700000010,"chain":"main","genesis_hash":"<genesis hash>"},"bounty_deltas":1,"changes":[{"sequence":123,"type":"pending_spend","txid":"<funding txid>","vout":2,"spending_txid":"<claim txid>","tip":{"height":700,"hash":"<publication hash>","mediantime":1700000000,"chain":"main","genesis_hash":"<genesis hash>"},"bounty":{"txid":"<funding txid>","vout":2,"amount":"10000000000","domain":"example.com","connection_work_target":"<64 hex>","root_certificates_version":1,"signature_algorithms_mask":7,"block_height":699,"block_hash":"<creation hash>","coinbase":false,"confirmations":2,"status":"pending_spend","spending_txid":"<claim txid>"}}],"next_cursor":"<opaque cursor>","has_more":false}
+```
+
+Rows and event tips are copied when the index publishes a coherent update. They are never fetched again from current state while reading a historical page. Several changes can be coalesced in one publication: each event then carries the **final coherent row at that publication**, even when its legacy `type` or `spending_txid` describes an earlier mutation. For example, an `added` event can carry a row already `spent`, or a `pending_spend` event a row already `available` after eviction. Apply the full `bounty` row by outpoint, in sequence order; do not infer its current status from the event type. `bounty:null` is used only for `window_exit`, which removes that outpoint. Missing required rows cause explicit resynchronization, never silent omission.
+
+The outer response `tip` is current at the page request; each event's `tip` and confirmation count remain historical. Later pages can include newer publications, and there is no frozen upper watermark for a whole bounty drain. Continue until `has_more:false`, then advance confirmations and coinbase maturity against the current canonical tip. The starting watermark and full initial block snapshots are still required; this option eliminates full-block refreshes for ordinary subsequent changes. Omitting `include_bounties` or setting it to `false` preserves the exact legacy response/event shapes, and subscription notifications remain unchanged. Nonboolean flags and extra parameters return `-32602`. Older servers reject the new flag; clients can deliberately use the legacy refresh flow, but must not treat a response lacking `bounty_deltas:1` as complete row deltas.
+
+The in-memory shared change journal defaults to 10,000 events or 8 MiB, whichever is reached first. The byte bound includes the private saved bounty rows and publication tips even when only legacy clients are connected. Old cursors, service restarts, missing required rows, large catchup and reorganizations require full resynchronization; they cannot silently skip events. A poll receives error `-32011`; a subscriber receives `resync_required:true`. Reorganizations discard the old journal before any further delta response, so disconnected-chain events are not replayed as current. If the connection is lost, resume from the last processed cursor or take a fresh snapshot if it expired. `getbountychanges` keeps its ordinary independent 200 calls per sliding minute per IP quota, with either flag value.
 
 Subscription methods return `subscription_id`, `tip` and the current change `cursor`. An address subscription requested with `changes_only:true` additionally returns `changes_only:true` as an explicit capability acknowledgement. The legacy request (omitting the flag or setting it to `false`) keeps the original three-field result. Repeating the same subscription and mode on the same connection reuses it; legacy and changes-only address subscriptions are distinct. Subscriptions belong to that connection and are deleted on disconnect. IDs cannot cancel another connection's subscriptions.
 
@@ -118,6 +128,18 @@ Both modes retain explicit refreshes on chain reorganization and bounded-index r
 ```
 
 Address notifications tell the client to update cached balance/history/UTXOs and confirmations; incremental clients should replay `getaddresschanges`, while legacy clients refresh their pages. They are not full transaction downloads. Tip notifications contain `kind:"tip"`, `tip`, `reorg`. Bounty notifications contain `kind:"bounties"`, `changes`, `tip`, `cursor`, or an explicit `resync_required:true`. Notifications do not consume request quotas, but subscriptions and output queues are bounded.
+
+## Indexed transaction status
+
+`gettransactionstatus` accepts exactly `{ "txid": "<64 hex>" }`. It normalizes the requested txid to lowercase and returns a compact receipt from the coherent active-chain/mempool index:
+
+```json
+{"tip":{"height":701,"hash":"<current hash>","mediantime":1700000010,"chain":"main","genesis_hash":"<genesis hash>"},"txid":"<requested txid>","status":"confirmed","block_hash":"<confirmation block>","block_height":700,"confirmations":2}
+```
+
+A pending receipt contains `tip`, `txid`, `status:"pending"` and `confirmations:0`, and omits `block_hash` and `block_height`. A confirmed receipt includes both block fields, with `confirmations = tip.height - block_height + 1`. The block location must still belong to the active indexed chain. Unknown, evicted and disconnected transactions return `-32004` unless they are present again in the current mempool. Index synchronization uses the same readiness gate as other indexed methods (`-32001`); inconsistent stored locations return `-32011` instead of a successful receipt. Invalid hashes, non-object parameters and extra fields return `-32602`.
+
+This method performs no backend transaction lookup and returns no serialized transaction, decoded inputs/outputs, proof or witness. It uses its own ordinary 200 calls per sliding minute per actual peer IP quota, including malformed requests, independently of `gettransaction` and `gettransactions`. Poll it to track a txid already known locally. The receipt is a server-reported indexed observation, not an inclusion proof or verification of transaction contents. An older server returns `-32601`; clients requiring compact receipts must not silently download a full transaction as confirmation polling fallback.
 
 ## Full transaction lookup and broadcast
 

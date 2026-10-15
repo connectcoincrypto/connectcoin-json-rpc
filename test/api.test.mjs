@@ -42,6 +42,7 @@ function fixture(options = {}) {
     blockAt: () => ({ height: 650, hash: HASH }),
     isRecentBlock: h => h === HASH, bountyPage: (h, off, n) => bountyRows.slice(off, off + n),
     bountyPageAfter: (h, { after, limit }) => bountyRows.filter(r => after == null || r.txid > after.txid || r.txid === after.txid && r.vout > after.vout).slice(0, limit),
+    bountyByOutpoint: (txid, vout) => ({ ...bountyRows[0], txid, vout }),
     balance: () => ({ confirmed: '10000000001', pending: '0' }),
     history: (addr, off, n) => bountyRows.slice(off, off + n).map(r => ({ txid: r.txid, received: r.amount, balance_delta: r.amount })),
     utxos: (addr, off, n) => bountyRows.slice(off, off + n), transactionLocation: txid => txid === HASH ? { block_hash: HASH, block_height: 650 } : null,
@@ -80,7 +81,7 @@ test('cursor signatures reject tampering, restart and oversize input', () => {
 
 test('whitelist excludes private RPC and enforces readiness and params', async () => {
   const f = fixture();
-  assert.equal(METHODS.length, 15);
+  assert.equal(METHODS.length, 16);
   for (const method of ['getblock', 'getblocktemplate', 'stop', 'dumpprivkey', '__proto__']) {
     await assert.rejects(f.api.dispatch(method, {}, f.context), { code: -32601 });
   }

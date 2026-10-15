@@ -7,7 +7,7 @@ import { normalizeAddress } from './address.mjs';
 export const METHODS = Object.freeze([
   'getchaintip', 'getrecentblockhashes', 'getblockbounties',
   'getaddressbalance', 'getaddressutxos', 'getaddresshistory', 'getaddresschanges',
-  'gettransaction', 'gettransactions', 'sendrawtransaction', 'getbountychanges',
+  'gettransaction', 'gettransactionstatus', 'gettransactions', 'sendrawtransaction', 'getbountychanges',
   'subscribebounties', 'subscribeaddress', 'subscribetip', 'unsubscribe',
 ]);
 
@@ -202,22 +202,28 @@ export class PublicAPI {
 
   updated(update) {
     const start = this.sequence;
-    const reset = (update.bountyChanges ?? []).some(c => c.type === 'resync_required');
-    if (reset) {
-      this.journal = [];
-      this.journalBytes = 0;
-      this.journalFloor = ++this.sequence;
-    }
+    let reset = Boolean(update.reorg || update.resync ||
+      (update.bountyChanges ?? []).some(c => c.type === 'resync_required' || c.type === 'reorg'));
     for (const change of reset ? [] : update.bountyChanges ?? []) {
-      const event = { sequence: ++this.sequence, ...change };
-      const bytes = Buffer.byteLength(JSON.stringify(event));
-      this.journal.push({ event, bytes });
+      // A synchronization can coalesce several mutations of one outpoint.
+      // Publish the final coherent row at THIS update, not a later live lookup
+      // during pagination. Keep the enriched payload private for legacy clients.
+      const bounty = change.type === 'window_exit' ? null : this.store.bountyByOutpoint(change.txid, change.vout);
+      if (!update.tip || change.type !== 'window_exit' && !bounty) { reset = true; break; }
+      const snapshot = structuredClone({ event: { ...change, sequence: ++this.sequence }, bounty, tip: update.tip });
+      const bytes = Buffer.byteLength(JSON.stringify(snapshot));
+      this.journal.push({ ...snapshot, bytes });
       this.journalBytes += bytes;
       while (this.journal.length > this.options.maxJournalEvents || this.journalBytes > this.options.maxJournalBytes) {
         const removed = this.journal.shift();
         this.journalBytes -= removed.bytes;
         this.journalFloor = removed.event.sequence;
       }
+    }
+    if (reset) {
+      this.journal = [];
+      this.journalBytes = 0;
+      this.journalFloor = ++this.sequence;
     }
     const touched = new Set(update.addresses ?? []);
     for (const sub of this.subscriptions.values()) {
@@ -401,6 +407,34 @@ export class PublicAPI {
       case 'getaddresshistory': return this.page('history', params);
       case 'getaddresschanges': return this.addressChanges(params);
       case 'gettransactions': return this.transactions(params, context);
+      case 'gettransactionstatus': {
+        paramsOnly(params, ['txid']);
+        const txid = hash(params.txid), tip = this.tip();
+        const location = this.store.transactionLocation(txid);
+        if (!location) throw new RpcError(-32004, 'Transaction not found in the current index or mempool.');
+        // These indexed reads are synchronous: no backend await can expose a
+        // different chain/mempool publication halfway through the receipt.
+        const canonicalHash = value => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+        if (!this.indexer.ready || !Number.isSafeInteger(tip.height) || tip.height < 0 ||
+            !canonicalHash(tip.hash) || !canonicalHash(tip.genesis_hash) ||
+            typeof tip.chain !== 'string' || !tip.chain || this.store.blockAt(tip.height)?.hash !== tip.hash ||
+            !['pending', 'confirmed'].includes(location.status)) {
+          throw new RpcError(-32011, 'Transaction state is inconsistent; retry after synchronization.');
+        }
+        if (location.status === 'pending') {
+          if (location.block_hash !== undefined || location.block_height !== undefined) {
+            throw new RpcError(-32011, 'Transaction state is inconsistent; retry after synchronization.');
+          }
+          return { tip, txid, status: 'pending', confirmations: 0 };
+        }
+        const { block_hash, block_height } = location;
+        if (!canonicalHash(block_hash) || !Number.isSafeInteger(block_height) || block_height < 0 ||
+            block_height > tip.height || this.store.blockAt(block_height)?.hash !== block_hash ||
+            !Number.isSafeInteger(tip.height - block_height + 1)) {
+          throw new RpcError(-32011, 'Transaction state is inconsistent; retry after synchronization.');
+        }
+        return { tip, txid, status: 'confirmed', block_hash, block_height, confirmations: tip.height - block_height + 1 };
+      }
       case 'gettransaction': {
         paramsOnly(params, ['txid']);
         const txid = hash(params.txid);
@@ -416,15 +450,20 @@ export class PublicAPI {
         return { tip: this.tip(), ...location, transaction };
       }
       case 'getbountychanges': {
-        paramsOnly(params, ['cursor']);
-        if (params.cursor == null) return { tip: this.tip(), changes: [], next_cursor: this.changeCursor(), has_more: false };
+        paramsOnly(params, ['cursor', 'include_bounties']);
+        if (Object.hasOwn(params, 'include_bounties') && typeof params.include_bounties !== 'boolean') {
+          throw new RpcError(-32602, 'include_bounties must be a boolean.');
+        }
+        const expanded = params.include_bounties === true ? { bounty_deltas: 1 } : {};
+        if (params.cursor == null) return { tip: this.tip(), changes: [], next_cursor: this.changeCursor(), has_more: false, ...expanded };
         const decoded = this.cursors.read(params.cursor);
         if (decoded.kind !== 'changes' || !Number.isSafeInteger(decoded.sequence) || decoded.sequence < this.journalFloor || decoded.sequence > this.sequence) {
           throw new RpcError(-32011, 'Change cursor expired; reload the recent-block snapshot.');
         }
-        const changes = this.journal.filter(e => e.event.sequence > decoded.sequence).slice(0, this.options.pageSize).map(e => e.event);
+        const changes = this.journal.filter(e => e.event.sequence > decoded.sequence).slice(0, this.options.pageSize)
+          .map(e => params.include_bounties === true ? { ...e.event, bounty: e.bounty, tip: e.tip } : e.event);
         const seq = changes.at(-1)?.sequence ?? decoded.sequence;
-        return { tip: this.tip(), changes, next_cursor: this.changeCursor(seq), has_more: seq < this.sequence };
+        return { tip: this.tip(), changes, next_cursor: this.changeCursor(seq), has_more: seq < this.sequence, ...expanded };
       }
       case 'subscribebounties': paramsOnly(params, []); return this.subscribe('bounties', params, context);
       case 'subscribeaddress':

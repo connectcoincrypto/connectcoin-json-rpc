@@ -536,6 +536,18 @@ export class Store {
       .all(hash, block.height, lastTxid, lastVout, limit);
     return this.formatBounties(rows);
   }
+  bountyByOutpoint(txid, vout) {
+    validHash(txid);
+    if (!Number.isSafeInteger(vout) || vout < 0 || vout > 0xffffffff) throw new Error('Invalid bounty output index');
+    // The primary outpoint key and indexed joins keep each publication lookup
+    // independent of the number of bounties in its creation block.
+    const row = this.db.prepare(`SELECT b.*,s.spender,p.spender AS pending_spender,blocks.hash AS block_hash
+      FROM bounties b JOIN blocks ON blocks.height=b.height
+      LEFT JOIN spends s ON s.txid=b.txid AND s.vout=b.vout
+      LEFT JOIN pending_spends p ON p.txid=b.txid AND p.vout=b.vout
+      WHERE b.txid=? AND b.vout=? AND b.height >= (SELECT MAX(height)-599 FROM blocks)`).get(txid, vout);
+    return row ? this.formatBounties([row])[0] : null;
+  }
   formatBounties(rows) {
     const tip = this.tip();
     return rows.map(row => {

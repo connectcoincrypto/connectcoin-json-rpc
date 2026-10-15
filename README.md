@@ -2,7 +2,7 @@
 
 A restricted, indexed API for ConnectCoin light wallets and Pay-to-Connect clients. It runs separately from the node and speaks **newline-delimited JSON-RPC 2.0 over persistent, unencrypted TCP**. No HTTPS, TLS, wallet secrets, mining RPCs, block downloads, or arbitrary RPC proxying are exposed.
 
-- Address balances, history, UTXOs, transaction lookup and broadcast.
+- Address balances, history, UTXOs, transaction lookup, compact confirmation receipts and broadcast.
 - All bounties in any requested active-chain block within the latest **600 blocks**, without a result-count cutoff.
 - Incremental bounty updates and address/tip subscriptions.
 - Persistent SQLite indexing, exact amounts, reorganization recovery and bounded network queues.
@@ -66,9 +66,10 @@ All parameters are named objects. Each request must have a string or safe-intege
 | `getaddresshistory` | `address`, optional `cursor` | Paginated per-address received/spent/net summaries and confirmation status |
 | `getaddresschanges` | `addresses` (1–100), optional `cursor` | Persistent, block-anchored history/UTXO upserts and removals; no cursor obtains a baseline watermark |
 | `gettransaction` | `txid` | Full decoded transaction and hex from the node, with indexed location |
+| `gettransactionstatus` | `txid` | Indexed pending/confirmed status, canonical block location and confirmations; no transaction bytes or node lookup |
 | `gettransactions` | `txids` | Compact hex for an ordered prefix of up to 32 indexed transactions, plus remaining IDs |
 | `sendrawtransaction` | `transaction_hex` | Broadcast an already-completed transaction; normal node validation/fee policy applies |
-| `getbountychanges` | optional `cursor` | Bounded, replayable incremental changes; no cursor obtains the starting watermark |
+| `getbountychanges` | optional `cursor`, boolean `include_bounties` | Bounded, replayable incremental changes; opt in to complete bounty rows and their original publication tips; no cursor obtains the starting watermark |
 | `subscribebounties` | `{}` | Bounty-change notifications, or explicit resync notices |
 | `subscribeaddress` | `address`, optional boolean `changes_only` | Address refresh notifications; opt in to actual address changes instead of every new tip |
 | `subscribetip` | `{}` | Tip-change notifications (optional alternative to polling `getchaintip`) |
@@ -88,6 +89,8 @@ Only native ConnectCoin P2PK Bech32m addresses are supported. The domain in a P2
 Counters combine all connections from an IP. Reconnecting does not reset them. Hash letter case and IPv4-mapped IPv6 spellings cannot create extra quotas. An initial request for each of 600 different blocks uses one call from each block's independent quota. Unknown method names share a 60/minute/IP bucket; malformed general requests use another 60/minute/IP bucket. Neither can allocate arbitrary method keys. Invalid parameters for an allowed method consume that method's quota. Server notifications do not count as client calls. Rate-limit state is in memory and resets on service restart; use one listener process per public endpoint, or an external shared enforcement layer for multiple replicas. Users behind the same NAT share a quota.
 
 Compact transaction batches are limited to two active calls across all clients, a 30-second total deadline and five seconds per backend call. Their JSON result is at most 1.5 MiB, below the default 2 MiB response frame. Clients continue with the returned `remaining` suffix when a full group does not fit; see [the compact batch contract](docs/protocol.md#compact-transaction-batches).
+
+`gettransactionstatus` and `getbountychanges` each use the ordinary independent 200/minute/IP quota. Set `include_bounties:true` and check `bounty_deltas:1` to apply complete indexed bounty deltas without reloading each changed block. Each event preserves its full row and tip at publication, including across pagination; `window_exit` removes the outpoint. For confirmation polling, `gettransactionstatus` reads only the coherent local index and never downloads the transaction or proof witness. These are indexed state reports, not inclusion proofs; see [the protocol](docs/protocol.md) for initial synchronization and explicit resync handling.
 
 The limiter's storage is bounded and fails closed at capacity; additional connection/queue/subscription limits can reject requests even below their method quota. These protect memory and concurrent work, and **never silently shorten a successful bounty list**. A client must receive `stream.end` with `complete: true` before treating a block snapshot as complete.
 

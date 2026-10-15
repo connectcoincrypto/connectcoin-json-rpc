@@ -14,7 +14,7 @@ const SECRET = 'http://rpc-user:secret-password@127.0.0.1:18888/private';
 const PUBLIC_METHODS = [
   'getchaintip', 'getrecentblockhashes', 'getblockbounties',
     'getaddressbalance', 'getaddressutxos', 'getaddresshistory', 'getaddresschanges',
-    'gettransaction', 'gettransactions', 'sendrawtransaction', 'getbountychanges',
+    'gettransaction', 'gettransactionstatus', 'gettransactions', 'sendrawtransaction', 'getbountychanges',
   'subscribebounties', 'subscribeaddress', 'subscribetip', 'unsubscribe',
 ];
 
